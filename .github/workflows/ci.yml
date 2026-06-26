@@ -44,9 +44,23 @@ jobs:
           source $HOME/venv-virtme/bin/activate
           kci report -k ~/linux
 
-      - name: Show report
+      - name: Show detailed results
         if: always()
-        run: cat /tmp/kci-report.md
+        run: |
+          echo "=== REPORT ==="
+          cat /tmp/kci-report.md
+          echo ""
+          echo "=== KUNIT RAW ==="
+          cat ~/linux/test-results/kunit.txt 2>/dev/null || echo "(empty)"
+          echo ""
+          echo "=== KSELFTEST FAILURES ==="
+          grep "^not ok" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== KVM-UNIT-TESTS FAILURES ==="
+          grep "^FAIL" ~/linux/test-results/kvm-unit-tests.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== KASAN/UBSAN BUGS ==="
+          grep -E "(BUG:|KASAN:|UBSAN:)" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"
 
       - name: Upload results
         if: always()

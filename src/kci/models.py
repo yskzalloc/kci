@@ -7,7 +7,7 @@ from pathlib import Path
 @dataclass
 class KernelConfig:
     """Kernel configuration source."""
-    source: str  # local path or URL
+    source: str  # local path, URL, or 'syzkaller'
     resolved_path: Path = field(default=Path("/tmp/kci-kernel.config"), init=False)
 
     def is_url(self) -> bool:
@@ -33,6 +33,7 @@ class RunConfig:
     memory: str = "4G"
     timeout_kunit: int = 1800
     timeout_kselftest: int = 7200
+    arch: str = "x86_64"
 
 
 @dataclass
@@ -43,6 +44,7 @@ class TestResults:
     failed: int = 0
     skipped: int = 0
     output_file: Path | None = None
+    failed_tests: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:

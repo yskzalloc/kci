@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from .config import resolve_config, validate_config
@@ -18,6 +21,16 @@ HOME = Path.home()
 VNG_PATH = HOME / "venv-virtme" / "bin" / "vng"
 KCIDEV_PATH = HOME / "venv-virtme" / "bin" / "kci-dev"
 KVM_UNIT_TESTS_DIR = HOME / "kvm-unit-tests"
+
+
+def _check_binaries() -> None:
+    """Check required binaries exist."""
+    if not VNG_PATH.exists():
+        sys.exit(f"Error: vng not found at {VNG_PATH}\n"
+                 f"Run: kci init")
+    if not KCIDEV_PATH.exists():
+        sys.exit(f"Error: kci-dev not found at {KCIDEV_PATH}\n"
+                 f"Run: kci init")
 
 
 def _validate_kernel(path: str) -> KernelSource:
@@ -36,9 +49,9 @@ def _validate_kernel(path: str) -> KernelSource:
     return KernelSource(path=p)
 
 
-def _get_runner() -> VirtmeRunner:
-    """Get the VM runner."""
-    return VirtmeRunner(VNG_PATH)
+def _config_hash(config_path: Path) -> str:
+    """SHA256 of config file for incremental build detection."""
+    return hashlib.sha256(config_path.read_bytes()).hexdigest()[:12]
 
 
 # --- Commands ---
@@ -78,18 +91,27 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 def cmd_build(args: argparse.Namespace) -> None:
     """Build kernel + kselftest."""
+    _check_binaries()
     kernel = _validate_kernel(args.kernel)
-    config_src = args.config if args.config != "syzkaller" else "syzkaller"
-    kconfig = KernelConfig(source=config_src)
-    config_path = resolve_config(kconfig)
+    kconfig = KernelConfig(source=args.config)
+    config_path = resolve_config(kconfig, arch=getattr(args, "arch", "x86_64"))
     validate_config(config_path)
 
-    make_vars = " ".join(args.vars) if args.vars else ""
     llvm = "LLVM=1" if "LLVM=1" in (args.vars or []) else ""
 
+    # Incremental build: skip --force if config unchanged
+    config_hash_file = kernel.path / ".kci-config-hash"
+    current_hash = _config_hash(config_path)
+    force = True
+    if config_hash_file.exists() and config_hash_file.read_text().strip() == current_hash:
+        print("Config unchanged, using incremental build (no --force)")
+        force = False
+
     print(f"=== Building kernel in {kernel.path} ===")
-    cmd = [
-        str(VNG_PATH), "--build", "--force",
+    cmd = [str(VNG_PATH), "--build"]
+    if force:
+        cmd.append("--force")
+    cmd += [
         "--config", str(config_path),
         "--configitem", "CONFIG_KUNIT=y",
         "--configitem", "CONFIG_KUNIT_ALL_TESTS=y",
@@ -100,6 +122,7 @@ def cmd_build(args: argparse.Namespace) -> None:
     if llvm:
         cmd.append("LLVM=1")
     subprocess.run(cmd, cwd=kernel.path, check=True)
+    config_hash_file.write_text(current_hash)
 
     print(f"=== Building kselftest ({args.targets}) ===")
     subprocess.run(f"make -j{args.jobs} headers", shell=True, cwd=kernel.path, check=True)
@@ -108,31 +131,42 @@ def cmd_build(args: argparse.Namespace) -> None:
         f"install INSTALL_PATH={kernel.path}/kselftest_install",
         shell=True, cwd=kernel.path, check=True,
     )
+
+    # Validate install
+    install_dir = kernel.path / "kselftest_install"
+    run_script = install_dir / "run_kselftest.sh"
+    if not run_script.exists():
+        sys.exit(f"Error: kselftest install failed — {run_script} not found")
+    test_dirs = [d for d in install_dir.iterdir() if d.is_dir()]
+    print(f"kselftest installed: {len(test_dirs)} target dirs")
+
     print("\nbuild done.")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
     """Run tests."""
+    _check_binaries()
     kernel = _validate_kernel(args.kernel)
     config = RunConfig(
         jobs=args.jobs,
         targets=args.targets,
+        arch=getattr(args, "arch", "x86_64"),
     )
-    runner = _get_runner()
+    runner = VirtmeRunner(VNG_PATH)
     suite = getattr(args, "suite", None)
+    filter_pattern = getattr(args, "filter", None)
 
     results: list[TestResults] = []
 
     if suite is None or suite == "kunit":
         results.append(run_kunit(runner, kernel, config))
     if suite is None or suite == "kselftest":
-        results.append(run_kselftest(runner, kernel, config))
+        results.append(run_kselftest(runner, kernel, config, filter_pattern=filter_pattern))
     if suite is None or suite == "kvm-unit-tests":
         results.append(run_kvm_unit_tests(KVM_UNIT_TESTS_DIR, kernel))
 
-    # Upstream comparison (only on full run)
     if suite is None:
-        upstream = fetch_upstream_failures(KCIDEV_PATH, kernel)
+        upstream = fetch_upstream_failures(KCIDEV_PATH, kernel, arch=config.arch)
         regressions = detect_regressions(kernel, upstream)
         print_summary(results, regressions, len(upstream))
     else:
@@ -141,10 +175,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_report(args: argparse.Namespace) -> None:
-    """Generate report: compare local results with KernelCI upstream."""
+    """Generate report."""
+    _check_binaries()
     kernel = _validate_kernel(args.kernel)
     from .runner import _parse_kunit_results, _parse_kselftest_results
-    from datetime import datetime
 
     results: list[TestResults] = []
     kunit_file = kernel.results_dir / "kunit.txt"
@@ -156,61 +190,107 @@ def cmd_report(args: argparse.Namespace) -> None:
     if kselftest_file.exists():
         results.append(_parse_kselftest_results(kselftest_file))
     if kvm_file.exists():
+        import re
         text = kvm_file.read_text()
         lines = text.splitlines()
+        failed_names = [l for l in lines if l.startswith("FAIL")]
         results.append(TestResults(
             suite="kvm-unit-tests",
             passed=sum(1 for l in lines if l.startswith("PASS")),
             failed=sum(1 for l in lines if l.startswith("FAIL")),
             skipped=sum(1 for l in lines if l.startswith("SKIP")),
             output_file=kvm_file,
+            failed_tests=failed_names,
         ))
 
-    upstream = fetch_upstream_failures(KCIDEV_PATH, kernel)
+    arch = getattr(args, "arch", "x86_64")
+    upstream = fetch_upstream_failures(KCIDEV_PATH, kernel, arch=arch)
     regressions = detect_regressions(kernel, upstream)
 
-    # Write markdown report
+    # JSON output
+    if getattr(args, "json", False):
+        report_data = {
+            "date": datetime.now().isoformat(),
+            "kernel": str(kernel.path),
+            "arch": arch,
+            "results": [
+                {"suite": r.suite, "passed": r.passed, "failed": r.failed,
+                 "skipped": r.skipped, "total": r.total, "failed_tests": r.failed_tests}
+                for r in results
+            ],
+            "upstream_failures": len(upstream),
+            "regressions": regressions,
+        }
+        json_path = Path("/tmp/kci-report.json")
+        json_path.write_text(json.dumps(report_data, indent=2) + "\n")
+        print(json.dumps(report_data, indent=2))
+        print(f"\nJSON report: {json_path}")
+        return
+
+    # Markdown report
     report_path = Path("/tmp/kci-report.md")
-    lines = [
-        f"# KCI Test Report",
-        f"",
+    md = [
+        "# KCI Test Report",
+        "",
         f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  ",
         f"**Kernel:** `{kernel.path}`  ",
-        f"**Arch:** x86_64  ",
-        f"",
-        f"## Results",
-        f"",
-        f"| Suite | Pass | Fail | Skip | Total |",
-        f"|-------|------|------|------|-------|",
+        f"**Arch:** {arch}  ",
+        "",
+        "## Results",
+        "",
+        "| Suite | Pass | Fail | Skip | Total |",
+        "|-------|------|------|------|-------|",
     ]
     for r in results:
-        lines.append(f"| {r.suite} | {r.passed} | {r.failed} | {r.skipped} | {r.total} |")
+        md.append(f"| {r.suite} | {r.passed} | {r.failed} | {r.skipped} | {r.total} |")
 
-    lines += [
-        f"",
-        f"## Upstream Comparison",
-        f"",
+    # Failed test names
+    all_failed = []
+    for r in results:
+        all_failed.extend(r.failed_tests)
+    if all_failed:
+        md += ["", "## Failed Tests", ""]
+        for t in all_failed[:100]:
+            md.append(f"- `{t}`")
+
+    md += [
+        "", "## Upstream Comparison", "",
         f"- **Upstream known failures:** {len(upstream)}",
         f"- **Local-only failures:** {len(regressions)}",
-        f"",
+        "",
     ]
-
     if regressions:
-        lines.append("### ⚠️ Potential Regressions (NOT seen upstream)")
-        lines.append("")
+        md.append("### ⚠️ Potential Regressions (NOT seen upstream)")
+        md.append("")
         for f in regressions[:50]:
-            lines.append(f"- `{f}`")
+            md.append(f"- `{f}`")
     else:
-        lines.append("### ✅ No new regressions")
-        lines.append("")
-        lines.append("All local failures match known upstream failures.")
+        md.append("### ✅ No new regressions")
+        md.append("")
+        md.append("All local failures match known upstream failures.")
 
-    lines += ["", f"---", f"*Generated by kci*"]
-    report_path.write_text("\n".join(lines) + "\n")
+    md += ["", "---", "*Generated by kci*"]
+    report_path.write_text("\n".join(md) + "\n")
 
-    # Also print summary to stdout
     print_summary(results, regressions, len(upstream))
     print(f"\nReport written to: {report_path}")
+
+
+def cmd_submit(args: argparse.Namespace) -> None:
+    """Submit results to KCIDB (requires token)."""
+    _check_binaries()
+    kernel = _validate_kernel(args.kernel)
+    results_dir = kernel.results_dir
+
+    if not results_dir.exists() or not any(results_dir.iterdir()):
+        sys.exit("Error: no test results found. Run tests first: kci run")
+
+    print("Submitting results to KernelCI...")
+    # TODO: implement once KCIDB token is available
+    # kci-dev submit --results <results_dir>
+    print("Note: kci submit requires a KCIDB token.")
+    print("Request one at: https://github.com/kernelci/kernelci-core/issues/new?template=kernelci-api-tokens.md")
+    print(f"Results directory: {results_dir}")
 
 
 def main() -> None:
@@ -227,6 +307,7 @@ def main() -> None:
     p_build.add_argument("-k", "--kernel", default=str(HOME / "net"), help="Kernel source (path or git URL)")
     p_build.add_argument("-t", "--targets", default="net bpf mm cgroup timers net/forwarding")
     p_build.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
+    p_build.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
     p_build.add_argument("vars", nargs="*", help="Make variables (e.g. LLVM=1)")
 
     # run
@@ -234,19 +315,34 @@ def main() -> None:
     p_run.add_argument("-k", "--kernel", default=str(HOME / "net"))
     p_run.add_argument("-t", "--targets", default="net bpf mm cgroup timers net/forwarding")
     p_run.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
+    p_run.add_argument("-f", "--filter", help="Filter kselftest (e.g. 'net:tls')")
+    p_run.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
     p_run.add_argument("suite", nargs="?", choices=["kunit", "kselftest", "kvm-unit-tests"],
                        help="Run specific test suite")
 
     # report
     p_report = sub.add_parser("report", help="Compare results with KernelCI upstream")
     p_report.add_argument("-k", "--kernel", default=str(HOME / "net"))
+    p_report.add_argument("--json", action="store_true", help="Output JSON instead of Markdown")
+    p_report.add_argument("--arch", default="x86_64")
+
+    # submit
+    p_submit = sub.add_parser("submit", help="Submit results to KCIDB (requires token)")
+    p_submit.add_argument("-k", "--kernel", default=str(HOME / "net"))
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
-    {"init": cmd_init, "build": cmd_build, "run": cmd_run, "report": cmd_report}[args.command](args)
+    dispatch = {
+        "init": cmd_init,
+        "build": cmd_build,
+        "run": cmd_run,
+        "report": cmd_report,
+        "submit": cmd_submit,
+    }
+    dispatch[args.command](args)
 
 
 if __name__ == "__main__":

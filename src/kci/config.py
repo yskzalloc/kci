@@ -10,22 +10,31 @@ from .models import KernelConfig
 
 SYZKALLER_BASE_URL = "https://syzkaller.appspot.com"
 SYZKALLER_UPSTREAM_URL = f"{SYZKALLER_BASE_URL}/upstream"
-TARGET_MANAGER = "ci-qemu-gce-upstream-auto"
+
+SYZKALLER_MANAGERS = {
+    "x86_64": "ci-qemu-gce-upstream-auto",
+    "arm64": "ci-upstream-gce-arm64",
+}
 
 
-def fetch_latest_syzkaller_config(dest: Path = Path("/tmp/kci-kernel.config")) -> Path:
+def fetch_latest_syzkaller_config(dest: Path = Path("/tmp/kci-kernel.config"),
+                                  arch: str = "x86_64") -> Path:
     """Scrape syzkaller dashboard for the latest upstream kernel config."""
-    print("Fetching latest syzkaller config...")
+    manager = SYZKALLER_MANAGERS.get(arch)
+    if not manager:
+        raise ValueError(f"No syzkaller config for arch: {arch}. Available: {list(SYZKALLER_MANAGERS.keys())}")
+
+    print(f"Fetching latest syzkaller config ({manager})...")
     with urllib.request.urlopen(SYZKALLER_UPSTREAM_URL) as response:
         html_content = response.read().decode("utf-8")
 
     pattern = re.compile(
-        rf"{TARGET_MANAGER}.*?href=\"([^\"]*?tag=KernelConfig[^\"]*?)\"",
+        rf"{manager}.*?href=\"([^\"]*?tag=KernelConfig[^\"]*?)\"",
         re.DOTALL,
     )
     match = pattern.search(html_content)
     if not match:
-        raise RuntimeError(f"Could not find config link for {TARGET_MANAGER}")
+        raise RuntimeError(f"Could not find config link for {manager}")
 
     config_url = f"{SYZKALLER_BASE_URL}{html.unescape(match.group(1))}"
     print(f"Downloading: {config_url}")
@@ -33,10 +42,10 @@ def fetch_latest_syzkaller_config(dest: Path = Path("/tmp/kci-kernel.config")) -
     return dest
 
 
-def resolve_config(config: KernelConfig) -> Path:
+def resolve_config(config: KernelConfig, arch: str = "x86_64") -> Path:
     """Resolve a KernelConfig to a local file path."""
     if config.source == "syzkaller":
-        return fetch_latest_syzkaller_config(config.resolved_path)
+        return fetch_latest_syzkaller_config(config.resolved_path, arch=arch)
     elif config.is_url():
         print(f"Downloading config from {config.source}...")
         subprocess.run(
