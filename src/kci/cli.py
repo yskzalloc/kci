@@ -26,11 +26,9 @@ KVM_UNIT_TESTS_DIR = HOME / "kvm-unit-tests"
 def _check_binaries() -> None:
     """Check required binaries exist."""
     if not VNG_PATH.exists():
-        sys.exit(f"Error: vng not found at {VNG_PATH}\n"
-                 f"Run: kci init")
+        sys.exit(f"Error: vng not found at {VNG_PATH}\nRun: kci init")
     if not KCIDEV_PATH.exists():
-        sys.exit(f"Error: kci-dev not found at {KCIDEV_PATH}\n"
-                 f"Run: kci init")
+        sys.exit(f"Error: kci-dev not found at {KCIDEV_PATH}\nRun: kci init")
 
 
 def _validate_kernel(path: str) -> KernelSource:
@@ -52,6 +50,42 @@ def _validate_kernel(path: str) -> KernelSource:
 def _config_hash(config_path: Path) -> str:
     """SHA256 of config file for incremental build detection."""
     return hashlib.sha256(config_path.read_bytes()).hexdigest()[:12]
+
+
+def _get_kernel_version(kernel: KernelSource) -> str:
+    """Get kernel version from Makefile and git commit."""
+    makefile = kernel.path / "Makefile"
+    version = patchlevel = sublevel = ""
+    for line in makefile.read_text().splitlines()[:10]:
+        if line.startswith("VERSION"):
+            version = line.split("=")[1].strip()
+        elif line.startswith("PATCHLEVEL"):
+            patchlevel = line.split("=")[1].strip()
+        elif line.startswith("SUBLEVEL"):
+            sublevel = line.split("=")[1].strip()
+    ver = f"{version}.{patchlevel}.{sublevel}"
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(kernel.path), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+        ver += f" ({commit})"
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return ver
+
+
+def _get_kci_token() -> str | None:
+    """Get KCI token from env or config file."""
+    token = os.environ.get("KCI_TOKEN")
+    if token:
+        return token
+    config_file = Path.home() / ".config" / "kci-dev" / "kci-dev.toml"
+    if config_file.exists():
+        for line in config_file.read_text().splitlines():
+            if "token" in line and "=" in line:
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
 
 
 # --- Commands ---
@@ -99,7 +133,6 @@ def cmd_build(args: argparse.Namespace) -> None:
 
     llvm = "LLVM=1" if "LLVM=1" in (args.vars or []) else ""
 
-    # Incremental build: skip --force if config unchanged
     config_hash_file = kernel.path / ".kci-config-hash"
     current_hash = _config_hash(config_path)
     force = True
@@ -132,14 +165,12 @@ def cmd_build(args: argparse.Namespace) -> None:
         shell=True, cwd=kernel.path, check=True,
     )
 
-    # Validate install
     install_dir = kernel.path / "kselftest_install"
     run_script = install_dir / "run_kselftest.sh"
     if not run_script.exists():
         sys.exit(f"Error: kselftest install failed — {run_script} not found")
     test_dirs = [d for d in install_dir.iterdir() if d.is_dir()]
     print(f"kselftest installed: {len(test_dirs)} target dirs")
-
     print("\nbuild done.")
 
 
@@ -151,6 +182,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         jobs=args.jobs,
         targets=args.targets,
         arch=getattr(args, "arch", "x86_64"),
+        retry=getattr(args, "retry", 0),
     )
     runner = VirtmeRunner(VNG_PATH)
     suite = getattr(args, "suite", None)
@@ -172,6 +204,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     else:
         for r in results:
             print(f"\n{r.suite}: {r.passed} pass, {r.failed} fail, {r.skipped} skip")
+            if r.flaky_tests:
+                print(f"  flaky: {len(r.flaky_tests)}")
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -179,6 +213,8 @@ def cmd_report(args: argparse.Namespace) -> None:
     _check_binaries()
     kernel = _validate_kernel(args.kernel)
     from .runner import _parse_kunit_results, _parse_kselftest_results
+
+    kernel_version = _get_kernel_version(kernel)
 
     results: list[TestResults] = []
     kunit_file = kernel.results_dir / "kunit.txt"
@@ -190,7 +226,6 @@ def cmd_report(args: argparse.Namespace) -> None:
     if kselftest_file.exists():
         results.append(_parse_kselftest_results(kselftest_file))
     if kvm_file.exists():
-        import re
         text = kvm_file.read_text()
         lines = text.splitlines()
         failed_names = [l for l in lines if l.startswith("FAIL")]
@@ -212,10 +247,12 @@ def cmd_report(args: argparse.Namespace) -> None:
         report_data = {
             "date": datetime.now().isoformat(),
             "kernel": str(kernel.path),
+            "kernel_version": kernel_version,
             "arch": arch,
             "results": [
                 {"suite": r.suite, "passed": r.passed, "failed": r.failed,
-                 "skipped": r.skipped, "total": r.total, "failed_tests": r.failed_tests}
+                 "skipped": r.skipped, "total": r.total, "failed_tests": r.failed_tests,
+                 "bugs": r.bugs}
                 for r in results
             ],
             "upstream_failures": len(upstream),
@@ -234,6 +271,7 @@ def cmd_report(args: argparse.Namespace) -> None:
         "",
         f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  ",
         f"**Kernel:** `{kernel.path}`  ",
+        f"**Version:** {kernel_version}  ",
         f"**Arch:** {arch}  ",
         "",
         "## Results",
@@ -244,7 +282,6 @@ def cmd_report(args: argparse.Namespace) -> None:
     for r in results:
         md.append(f"| {r.suite} | {r.passed} | {r.failed} | {r.skipped} | {r.total} |")
 
-    # Failed test names
     all_failed = []
     for r in results:
         all_failed.extend(r.failed_tests)
@@ -275,9 +312,32 @@ def cmd_report(args: argparse.Namespace) -> None:
     print_summary(results, regressions, len(upstream))
     print(f"\nReport written to: {report_path}")
 
+    # GitHub notification on regression
+    if regressions:
+        _notify_github(regressions, kernel_version, arch)
+
+
+def _notify_github(regressions: list[str], kernel_version: str, arch: str) -> None:
+    """Create GitHub issue if regressions found and GITHUB_REPOSITORY is set."""
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        return
+    title = f"Kernel regression detected: {kernel_version} ({arch})"
+    body = f"## Regressions found in {kernel_version}\\n\\n"
+    for r in regressions[:20]:
+        body += f"- `{r}`\\n"
+    try:
+        subprocess.run(
+            ["gh", "api", f"/repos/{repo}/issues", "-f", f"title={title}", "-f", f"body={body}"],
+            check=True, capture_output=True,
+        )
+        print(f"  GitHub issue created on {repo}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"  GitHub notification skipped: {e}")
+
 
 def cmd_submit(args: argparse.Namespace) -> None:
-    """Submit results to KCIDB (requires token)."""
+    """Submit results to KCIDB."""
     _check_binaries()
     kernel = _validate_kernel(args.kernel)
     results_dir = kernel.results_dir
@@ -285,12 +345,111 @@ def cmd_submit(args: argparse.Namespace) -> None:
     if not results_dir.exists() or not any(results_dir.iterdir()):
         sys.exit("Error: no test results found. Run tests first: kci run")
 
-    print("Submitting results to KernelCI...")
-    # TODO: implement once KCIDB token is available
-    # kci-dev submit --results <results_dir>
-    print("Note: kci submit requires a KCIDB token.")
-    print("Request one at: https://github.com/kernelci/kernelci-core/issues/new?template=kernelci-api-tokens.md")
-    print(f"Results directory: {results_dir}")
+    token = _get_kci_token()
+    if not token:
+        sys.exit("Error: No KCI token found. Set KCI_TOKEN env var or configure "
+                 "~/.config/kci-dev/kci-dev.toml\n"
+                 "Request one at: https://github.com/kernelci/kernelci-core/issues/new?template=kernelci-api-tokens.md")
+
+    kernel_version = _get_kernel_version(kernel)
+    print(f"Submitting results for {kernel_version}...")
+
+    # Prepare KCIDB-compatible JSON
+    from .runner import _parse_kunit_results, _parse_kselftest_results
+    tests = []
+    kselftest_file = results_dir / "kselftest.txt"
+    kunit_file = results_dir / "kunit.txt"
+
+    for fpath, suite in [(kunit_file, "kunit"), (kselftest_file, "kselftest")]:
+        if fpath.exists():
+            parse_fn = _parse_kunit_results if suite == "kunit" else _parse_kselftest_results
+            r = parse_fn(fpath)
+            tests.append({
+                "id": f"kci:{suite}:{kernel_version}",
+                "build_id": f"kci:build:{kernel_version}",
+                "path": suite,
+                "status": "PASS" if r.failed == 0 else "FAIL",
+                "start_time": datetime.now().isoformat(),
+            })
+
+    submission = {"version": {"major": 4, "minor": 3}, "tests": tests}
+    json_path = results_dir / "kcidb-submission.json"
+    json_path.write_text(json.dumps(submission, indent=2) + "\n")
+
+    # Try kci-dev submit
+    result = subprocess.run(
+        [str(KCIDEV_PATH), "submit", "--token", token, "--json", str(json_path)],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode == 0:
+        print("Results submitted successfully.")
+    else:
+        print(f"kci-dev submit output: {result.stdout}{result.stderr}")
+        print(f"Submission JSON saved to: {json_path}")
+
+
+def cmd_notify(args: argparse.Namespace) -> None:
+    """Create GitHub issue for regressions."""
+    _check_binaries()
+    kernel = _validate_kernel(args.kernel)
+    arch = getattr(args, "arch", "x86_64")
+
+    upstream = fetch_upstream_failures(KCIDEV_PATH, kernel, arch=arch)
+    regressions = detect_regressions(kernel, upstream)
+
+    if not regressions:
+        print("No regressions found. No notification sent.")
+        return
+
+    kernel_version = _get_kernel_version(kernel)
+    _notify_github(regressions, kernel_version, arch)
+    if not os.environ.get("GITHUB_REPOSITORY"):
+        print("Set GITHUB_REPOSITORY env var to enable GitHub notifications.")
+
+
+def cmd_bisect(args: argparse.Namespace) -> None:
+    """Bisect to find commit that introduced a test failure."""
+    _check_binaries()
+    kernel = _validate_kernel(args.kernel)
+
+    good = args.good
+    bad = args.bad
+    test = args.test
+
+    print(f"Bisecting {kernel.path}: good={good} bad={bad} test={test}")
+
+    # Create a test script for git bisect run
+    script = kernel.path / ".kci-bisect-test.sh"
+    script.write_text(f"""#!/bin/bash
+set -e
+# Build
+{VNG_PATH} --build --force --jobs {os.cpu_count()} 2>/dev/null
+# Run the specific test
+RESULT=$({VNG_PATH} --rw --memory 4G --cpus {os.cpu_count()} --user root \\
+    --exec "cd kselftest_install && ./run_kselftest.sh -t {test} 2>&1" 2>/dev/null)
+if echo "$RESULT" | grep -q "^not ok"; then
+    exit 1
+fi
+exit 0
+""")
+    script.chmod(0o755)
+
+    # Run git bisect
+    subprocess.run(["git", "-C", str(kernel.path), "bisect", "start"], check=True)
+    subprocess.run(["git", "-C", str(kernel.path), "bisect", "bad", bad], check=True)
+    subprocess.run(["git", "-C", str(kernel.path), "bisect", "good", good], check=True)
+
+    result = subprocess.run(
+        ["git", "-C", str(kernel.path), "bisect", "run", str(script)],
+        check=False,
+    )
+
+    # Show result
+    subprocess.run(["git", "-C", str(kernel.path), "bisect", "log"], check=False)
+    subprocess.run(["git", "-C", str(kernel.path), "bisect", "reset"], check=False)
+    script.unlink(missing_ok=True)
+
+    sys.exit(result.returncode)
 
 
 def main() -> None:
@@ -317,6 +476,7 @@ def main() -> None:
     p_run.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
     p_run.add_argument("-f", "--filter", help="Filter kselftest (e.g. 'net:tls')")
     p_run.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
+    p_run.add_argument("--retry", type=int, default=0, help="Retry failed tests N times")
     p_run.add_argument("suite", nargs="?", choices=["kunit", "kselftest", "kvm-unit-tests"],
                        help="Run specific test suite")
 
@@ -327,8 +487,20 @@ def main() -> None:
     p_report.add_argument("--arch", default="x86_64")
 
     # submit
-    p_submit = sub.add_parser("submit", help="Submit results to KCIDB (requires token)")
+    p_submit = sub.add_parser("submit", help="Submit results to KCIDB")
     p_submit.add_argument("-k", "--kernel", default=str(HOME / "net"))
+
+    # notify
+    p_notify = sub.add_parser("notify", help="GitHub notification on regression")
+    p_notify.add_argument("-k", "--kernel", default=str(HOME / "net"))
+    p_notify.add_argument("--arch", default="x86_64")
+
+    # bisect
+    p_bisect = sub.add_parser("bisect", help="Bisect to find regression commit")
+    p_bisect.add_argument("-k", "--kernel", default=str(HOME / "net"))
+    p_bisect.add_argument("--good", required=True, help="Known good commit")
+    p_bisect.add_argument("--bad", required=True, help="Known bad commit")
+    p_bisect.add_argument("--test", required=True, help="Test to run (e.g. 'net:tls')")
 
     args = parser.parse_args()
     if not args.command:
@@ -341,6 +513,8 @@ def main() -> None:
         "run": cmd_run,
         "report": cmd_report,
         "submit": cmd_submit,
+        "notify": cmd_notify,
+        "bisect": cmd_bisect,
     }
     dispatch[args.command](args)
 

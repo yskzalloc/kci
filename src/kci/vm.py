@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from typing import Protocol
 
@@ -38,5 +39,16 @@ class VirtmeRunner:
         if user:
             cmd += f" --user {user}"
         cmd += f' --exec "{exec_cmd}"'
-        return subprocess.run(cmd, shell=True, cwd=kernel.path, check=False,
-                              capture_output=True, text=True)
+
+        # Stream output live while capturing it
+        captured = []
+        proc = subprocess.Popen(cmd, shell=True, cwd=kernel.path,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True)
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            captured.append(line)
+        proc.wait()
+        stdout = "".join(captured)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout=stdout, stderr="")

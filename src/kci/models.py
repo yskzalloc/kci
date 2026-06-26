@@ -34,6 +34,7 @@ class RunConfig:
     timeout_kunit: int = 1800
     timeout_kselftest: int = 7200
     arch: str = "x86_64"
+    retry: int = 0
 
 
 @dataclass
@@ -45,6 +46,8 @@ class TestResults:
     skipped: int = 0
     output_file: Path | None = None
     failed_tests: list[str] = field(default_factory=list)
+    bugs: list[str] = field(default_factory=list)
+    flaky_tests: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:

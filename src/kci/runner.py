@@ -33,25 +33,67 @@ def validate_kselftest_install(kernel: KernelSource) -> None:
     run_script = install_dir / "run_kselftest.sh"
     if not run_script.exists():
         sys.exit(f"Error: {run_script} missing. Rebuild with: kci build")
-    # Check at least one target dir has files
     test_dirs = [d for d in install_dir.iterdir() if d.is_dir()]
     if not test_dirs:
         sys.exit(f"Error: {install_dir} has no test directories. Check build deps.")
 
 
+def _parse_bugs(output: str) -> list[str]:
+    """Parse KASAN/BUG/Oops from output and correlate with nearest test."""
+    bugs = []
+    last_test = ""
+    for line in output.splitlines():
+        if re.match(r"^(ok|not ok)\s+\d+", line):
+            last_test = line.strip()
+        if re.search(r"(KASAN:|BUG:|Oops:|WARNING:|UBSAN:)", line):
+            entry = line.strip()
+            if last_test:
+                entry = f"{entry} [near: {last_test}]"
+            bugs.append(entry)
+    return bugs
+
+
+def _retry_failed_tests(runner: VMRunner, kernel: KernelSource, config: RunConfig,
+                        failed_tests: list[str], retries: int) -> tuple[list[str], list[str]]:
+    """Retry failed tests individually, return (still_failed, flaky)."""
+    still_failed = []
+    flaky = []
+    for test_line in failed_tests:
+        # Extract test name pattern like "net:tls" from "not ok 5 selftests: net: tls"
+        m = re.search(r"selftests:\s*(\S+):\s*(\S+)", test_line)
+        if not m:
+            still_failed.append(test_line)
+            continue
+        target, name = m.group(1), m.group(2)
+        filter_pat = f"{target}:{name}"
+        passed_on_retry = False
+        for _ in range(retries):
+            run_cmd = f"./run_kselftest.sh -t {filter_pat}"
+            exec_cmd = f"{KSELFTEST_SETUP}; cd kselftest_install && {run_cmd} 2>&1"
+            result = runner.run(kernel, exec_cmd, config, user="root", network="user",
+                                timeout=300)
+            if result.stdout and "not ok" not in result.stdout:
+                passed_on_retry = True
+                break
+        if passed_on_retry:
+            flaky.append(test_line)
+        else:
+            still_failed.append(test_line)
+    return still_failed, flaky
+
+
 def run_kunit(runner: VMRunner, kernel: KernelSource, config: RunConfig) -> TestResults:
-    """Run kunit tests via vng boot (kunit runs at boot via CONFIG_KUNIT)."""
+    """Run kunit tests using kunit.py via vng."""
     kernel.results_dir.mkdir(exist_ok=True)
     output = kernel.results_dir / "kunit.txt"
 
     print("\n--- kunit ---")
-    exec_cmd = "dmesg | grep -E '(# Totals|not ok)'"
+    exec_cmd = "./tools/testing/kunit/kunit.py run --raw_output"
     result = runner.run(kernel, exec_cmd, config, timeout=config.timeout_kunit)
 
     stdout = result.stdout or ""
     if stdout:
         output.write_text(stdout)
-        print(stdout)
     else:
         print("Warning: no kunit output captured")
 
@@ -70,7 +112,6 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
     if filter_pattern:
         print(f"    filter: {filter_pattern}")
 
-    # Build the run command with optional filter
     run_cmd = "./run_kselftest.sh"
     if filter_pattern:
         run_cmd = f"./run_kselftest.sh -t {filter_pattern}"
@@ -80,7 +121,7 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         f"cd kselftest_install && {run_cmd} 2>&1 "
         "| grep -E '(^ok|^not ok|# PASS|# FAIL|# SKIP|# Totals)'; "
         "echo '=== DMESG BUGS ==='; "
-        "dmesg | grep -E '(BUG:|WARNING:|UBSAN:|KASAN:)'"
+        "dmesg | grep -E '(BUG:|WARNING:|UBSAN:|KASAN:|Oops:)'"
     )
     result = runner.run(kernel, exec_cmd, config, user="root", network="user",
                         timeout=config.timeout_kselftest)
@@ -88,11 +129,29 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
     stdout = result.stdout or ""
     if stdout:
         output.write_text(stdout)
-        print(stdout)
     else:
         print("Warning: no kselftest output captured")
 
-    return _parse_kselftest_results(output)
+    results = _parse_kselftest_results(output)
+
+    # KASAN/Oops correlation
+    results.bugs = _parse_bugs(stdout)
+    if results.bugs:
+        print(f"  ⚠️  {len(results.bugs)} kernel bugs detected")
+
+    # Per-test retry
+    if config.retry > 0 and results.failed_tests:
+        print(f"  Retrying {len(results.failed_tests)} failed tests (up to {config.retry}x)...")
+        still_failed, flaky = _retry_failed_tests(
+            runner, kernel, config, results.failed_tests, config.retry)
+        results.flaky_tests = flaky
+        results.failed_tests = still_failed
+        results.failed = len(still_failed)
+        results.passed += len(flaky)
+        if flaky:
+            print(f"  {len(flaky)} tests marked flaky (passed on retry)")
+
+    return results
 
 
 def run_kvm_unit_tests(kvm_tests_dir: Path, kernel: KernelSource) -> TestResults:
@@ -126,9 +185,9 @@ def _parse_kunit_results(output: Path) -> TestResults:
     if not output.exists():
         return TestResults(suite="kunit")
     lines = output.read_text().splitlines()
-    passed = sum(1 for l in lines if "# Totals" in l and "fail:0" in l)
-    failed = sum(1 for l in lines if l.strip().startswith("not ok"))
-    failed_names = [l.strip() for l in lines if l.strip().startswith("not ok")]
+    passed = sum(1 for l in lines if re.match(r"^\s*ok\s+\d+", l))
+    failed = sum(1 for l in lines if re.match(r"^\s*not ok\s+\d+", l))
+    failed_names = [l.strip() for l in lines if re.match(r"^\s*not ok", l)]
     return TestResults(suite="kunit", passed=passed, failed=failed,
                        output_file=output, failed_tests=failed_names)
 
