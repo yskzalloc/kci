@@ -238,7 +238,7 @@ def run_stress(runner: VMRunner, kernel: KernelSource, config: RunConfig,
     exec_cmd = f"STRESS_NG={stress_ng_bin} bash .kci-stress.sh"
 
     result = runner.run(kernel, exec_cmd, config, user="root", network="user",
-                        timeout=2400)  # 40 min max
+                        timeout=3900)  # 65 min max
 
     stdout = result.stdout or ""
     if stdout:
