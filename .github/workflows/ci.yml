@@ -50,17 +50,23 @@ jobs:
           echo "=== REPORT ==="
           cat /tmp/kci-report.md
           echo ""
-          echo "=== KUNIT RAW ==="
+          echo "=== KUNIT RESULTS ==="
           cat ~/linux/test-results/kunit.txt 2>/dev/null || echo "(empty)"
           echo ""
-          echo "=== KSELFTEST FAILURES ==="
+          echo "=== KUNIT FAILURES ==="
+          grep "not ok" ~/linux/test-results/kunit.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== KSELFTEST ALL FAILURES ==="
           grep "^not ok" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== KSELFTEST SUMMARY (per suite) ==="
+          grep "# Totals" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"
           echo ""
           echo "=== KVM-UNIT-TESTS FAILURES ==="
           grep "^FAIL" ~/linux/test-results/kvm-unit-tests.txt 2>/dev/null || echo "(none)"
           echo ""
-          echo "=== KASAN/UBSAN BUGS ==="
-          grep -E "(BUG:|KASAN:|UBSAN:)" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"
+          echo "=== KASAN/UBSAN/OOPS BUGS ==="
+          grep -E "(BUG:|KASAN:|UBSAN:|Oops:)" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"
 
       - name: Upload results
         if: always()
@@ -70,3 +76,4 @@ jobs:
           path: |
             ~/linux/test-results/
             /tmp/kci-report.md
+            /tmp/kci-report.json

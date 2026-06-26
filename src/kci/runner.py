@@ -121,13 +121,22 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         f"cd kselftest_install && {run_cmd} 2>&1 "
         "| grep -E '(^ok|^not ok|# PASS|# FAIL|# SKIP|# Totals)'; "
         "echo '=== DMESG BUGS ==='; "
-        "dmesg | grep -E '(BUG:|WARNING:|UBSAN:|KASAN:|Oops:)'"
+        "dmesg | grep -E '(BUG:|WARNING:|UBSAN:|KASAN:|Oops:)'; "
+        "echo '=== FULL DMESG ==='; "
+        "dmesg"
     )
     result = runner.run(kernel, exec_cmd, config, user="root", network="user",
                         timeout=config.timeout_kselftest)
 
     stdout = result.stdout or ""
     if stdout:
+        output.write_text(stdout)
+        # Save dmesg separately
+        dmesg_file = kernel.results_dir / "dmesg-kselftest.txt"
+        dmesg_marker = "=== FULL DMESG ==="
+        if dmesg_marker in stdout:
+            dmesg_content = stdout.split(dmesg_marker, 1)[1]
+            dmesg_file.write_text(dmesg_content)
         output.write_text(stdout)
     else:
         print("Warning: no kselftest output captured")

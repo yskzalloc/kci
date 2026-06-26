@@ -157,13 +157,24 @@ def cmd_build(args: argparse.Namespace) -> None:
     subprocess.run(cmd, cwd=kernel.path, check=True)
     config_hash_file.write_text(current_hash)
 
+    # Merge kselftest config requirements (enables configs tests need)
+    print("=== Merging kselftest config ===")
+    subprocess.run(f"make -j{args.jobs} kselftest-merge", shell=True, cwd=kernel.path, check=False)
+
     print(f"=== Building kselftest ({args.targets}) ===")
     subprocess.run(f"make -j{args.jobs} headers", shell=True, cwd=kernel.path, check=True)
-    subprocess.run(
-        f'make -C tools/testing/selftests TARGETS="{args.targets}" '
-        f"install INSTALL_PATH={kernel.path}/kselftest_install",
-        shell=True, cwd=kernel.path, check=True,
-    )
+    skip = getattr(args, "skip_targets", "")
+    if args.targets == "all":
+        # Full bundle: build + install everything
+        install_cmd = f"make -j{args.jobs} kselftest-install INSTALL_PATH={kernel.path}/kselftest_install"
+        if skip:
+            install_cmd = f'make -j{args.jobs} SKIP_TARGETS="{skip}" kselftest-install INSTALL_PATH={kernel.path}/kselftest_install'
+    else:
+        install_cmd = (
+            f'make -C tools/testing/selftests TARGETS="{args.targets}" '
+            f"install INSTALL_PATH={kernel.path}/kselftest_install"
+        )
+    subprocess.run(install_cmd, shell=True, cwd=kernel.path, check=True)
 
     install_dir = kernel.path / "kselftest_install"
     run_script = install_dir / "run_kselftest.sh"
@@ -464,7 +475,11 @@ def main() -> None:
     p_build = sub.add_parser("build", help="Build kernel + kselftest")
     p_build.add_argument("-c", "--config", default="syzkaller", help="Kernel config (path, URL, or 'syzkaller')")
     p_build.add_argument("-k", "--kernel", default=str(HOME / "net"), help="Kernel source (path or git URL)")
-    p_build.add_argument("-t", "--targets", default="net bpf mm cgroup timers net/forwarding")
+    p_build.add_argument("-t", "--targets", default="all",
+                         help="Kselftest targets (or 'all' for full suite)")
+    p_build.add_argument("-s", "--skip", default="arm64 powerpc sparc64 riscv ia64",
+                         dest="skip_targets",
+                         help="Skip these targets (default: non-x86 archs)")
     p_build.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
     p_build.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
     p_build.add_argument("vars", nargs="*", help="Make variables (e.g. LLVM=1)")
@@ -472,7 +487,7 @@ def main() -> None:
     # run
     p_run = sub.add_parser("run", help="Run tests")
     p_run.add_argument("-k", "--kernel", default=str(HOME / "net"))
-    p_run.add_argument("-t", "--targets", default="net bpf mm cgroup timers net/forwarding")
+    p_run.add_argument("-t", "--targets", default="all")
     p_run.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
     p_run.add_argument("-f", "--filter", help="Filter kselftest (e.g. 'net:tls')")
     p_run.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")

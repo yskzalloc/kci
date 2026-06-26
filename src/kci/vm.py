@@ -32,7 +32,7 @@ class VirtmeRunner:
             user: str | None = None, network: str = "user",
             timeout: int = 7200) -> subprocess.CompletedProcess:
         cmd = (
-            f"timeout {timeout} {self.vng} --rw "
+            f"timeout {timeout} {self.vng} --rw --verbose "
             f"--memory {config.memory} --cpus {config.jobs} "
             f"--append 'panic_on_warn=0' --network {network}"
         )
@@ -40,7 +40,7 @@ class VirtmeRunner:
             cmd += f" --user {user}"
         cmd += f' --exec "{exec_cmd}"'
 
-        # Stream output live while capturing it
+        # Stream output live while capturing
         captured = []
         proc = subprocess.Popen(cmd, shell=True, cwd=kernel.path,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
