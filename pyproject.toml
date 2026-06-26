@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kci"
+version = "0.1.0"
+description = "Local kernel CI tool with KernelCI integration"
+requires-python = ">=3.11"
+license = {text = "GPL-2.0"}
+authors = [{name = "Yunseong Kim", email = "yunseong.kim@est.tech"}]
+
+[project.scripts]
+kci = "kci.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
