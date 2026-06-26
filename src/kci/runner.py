@@ -212,3 +212,46 @@ def _parse_kselftest_results(output: Path) -> TestResults:
     failed_names = [l for l in lines if l.startswith("not ok")]
     return TestResults(suite="kselftest", passed=passed, failed=failed,
                        skipped=skipped, output_file=output, failed_tests=failed_names)
+
+STRESS_NG_SCRIPT_PATH = Path(__file__).parent / "scripts" / "kernel-coverage.sh"
+
+
+def run_stress(runner: VMRunner, kernel: KernelSource, config: RunConfig,
+               duration: int = 5) -> TestResults:
+    """Run stress-ng kernel coverage test in VM."""
+    kernel.results_dir.mkdir(exist_ok=True)
+    output = kernel.results_dir / "stress-ng.txt"
+
+    print(f"\n--- stress-ng (duration per stressor: {duration}s) ---")
+
+    # Copy script and stress-ng binary into kernel tree for VM access
+    dest_script = kernel.path / ".kci-stress.sh"
+    script_content = STRESS_NG_SCRIPT_PATH.read_text().replace(
+        'DURATION="${STRESS_DURATION:-5}"',
+        f'DURATION="{duration}"'
+    )
+    dest_script.write_text(script_content)
+    dest_script.chmod(0o755)
+
+    # stress-ng binary path (built during init)
+    stress_ng_bin = Path.home() / "stress-ng" / "stress-ng"
+    exec_cmd = f"STRESS_NG={stress_ng_bin} bash .kci-stress.sh"
+
+    result = runner.run(kernel, exec_cmd, config, user="root", network="user",
+                        timeout=2400)  # 40 min max
+
+    stdout = result.stdout or ""
+    if stdout:
+        output.write_text(stdout)
+
+    # Parse: count BUG/KASAN/UBSAN in output
+    bugs = [l for l in stdout.splitlines()
+            if any(k in l for k in ("BUG:", "KASAN:", "UBSAN:", "Oops:"))]
+
+    return TestResults(
+        suite="stress-ng",
+        passed=1 if not bugs else 0,
+        failed=len(bugs),
+        output_file=output,
+        bugs=bugs,
+    )

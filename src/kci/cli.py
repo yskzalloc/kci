@@ -14,7 +14,7 @@ from pathlib import Path
 from .config import resolve_config, validate_config
 from .comparison import detect_regressions, fetch_upstream_failures, print_summary
 from .models import KernelConfig, KernelSource, RunConfig, TestResults
-from .runner import run_kunit, run_kselftest, run_kvm_unit_tests
+from .runner import run_kunit, run_kselftest, run_kvm_unit_tests, run_stress
 from .vm import VirtmeRunner
 
 HOME = Path.home()
@@ -120,6 +120,12 @@ def cmd_init(args: argparse.Namespace) -> None:
         run(f"git clone https://gitlab.com/kvm-unit-tests/kvm-unit-tests.git {KVM_UNIT_TESTS_DIR}")
     run(f"cd {KVM_UNIT_TESTS_DIR} && ./configure --arch=x86_64 && make -j{os.cpu_count()}")
 
+    print("=== Cloning and building stress-ng ===")
+    stress_ng_dir = HOME / "stress-ng"
+    if not stress_ng_dir.exists():
+        run(f"git clone https://github.com/ColinIanKing/stress-ng.git {stress_ng_dir}")
+    run(f"make -j{os.cpu_count()} -C {stress_ng_dir}")
+
     print("\ninit done.")
 
 
@@ -207,6 +213,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         results.append(run_kselftest(runner, kernel, config, filter_pattern=filter_pattern))
     if suite is None or suite == "kvm-unit-tests":
         results.append(run_kvm_unit_tests(KVM_UNIT_TESTS_DIR, kernel))
+    if suite == "stress":
+        results.append(run_stress(runner, kernel, config))
 
     if suite is None:
         upstream = fetch_upstream_failures(KCIDEV_PATH, kernel, arch=config.arch)
@@ -492,7 +500,7 @@ def main() -> None:
     p_run.add_argument("-f", "--filter", help="Filter kselftest (e.g. 'net:tls')")
     p_run.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
     p_run.add_argument("--retry", type=int, default=0, help="Retry failed tests N times")
-    p_run.add_argument("suite", nargs="?", choices=["kunit", "kselftest", "kvm-unit-tests"],
+    p_run.add_argument("suite", nargs="?", choices=["kunit", "kselftest", "kvm-unit-tests", "stress"],
                        help="Run specific test suite")
 
     # report
