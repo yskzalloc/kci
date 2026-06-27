@@ -101,14 +101,17 @@ def run_kunit(runner: VMRunner, kernel: KernelSource, config: RunConfig) -> Test
 
 
 def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
-                  filter_pattern: str | None = None) -> TestResults:
-    """Run kselftest via VM."""
+                  filter_pattern: str | None = None,
+                  include_stress: bool = False,
+                  include_kunit: bool = False) -> tuple[TestResults, TestResults | None]:
+    """Run kselftest (and optionally kunit + stress-ng) in a single VM boot."""
     kernel.results_dir.mkdir(exist_ok=True)
     output = kernel.results_dir / "kselftest.txt"
+    kunit_output = kernel.results_dir / "kunit.txt"
 
     validate_kselftest_install(kernel)
 
-    print(f"\n--- kselftest ({config.targets}) ---")
+    print(f"\n--- single boot: {'kunit + ' if include_kunit else ''}kselftest{' + stress' if include_stress else ''} ---")
     if filter_pattern:
         print(f"    filter: {filter_pattern}")
 
@@ -116,37 +119,116 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
     if filter_pattern:
         run_cmd = f"./run_kselftest.sh -t {filter_pattern}"
 
+    # kunit part (run kunit.py first)
+    kunit_part = ""
+    if include_kunit:
+        kunit_part = (
+            "echo '=== KUNIT START ==='; "
+            "cd /root && ./tools/testing/kunit/kunit.py run --raw_output 2>&1; "
+            "echo '=== KUNIT END ==='; "
+        )
+
+    # Stress part
+    stress_part = ""
+    if include_stress:
+        dest_script = kernel.path / ".kci-stress.sh"
+        dest_script.write_text(STRESS_NG_SCRIPT_PATH.read_text())
+        dest_script.chmod(0o755)
+        stress_ng_bin = Path.home() / "stress-ng" / "stress-ng"
+        stress_part = (
+            "echo '=== STRESS START ==='; "
+            f"STRESS_NG={stress_ng_bin} bash .kci-stress.sh; "
+            "echo '=== STRESS END ==='; "
+        )
+
+    # kvm-unit-tests part (nested KVM inside vng)
+    kvm_tests_dir = Path.home() / "kvm-unit-tests"
+    kvm_part = ""
+    if kvm_tests_dir.exists() and (kvm_tests_dir / "x86-run").exists():
+        kvm_part = (
+            "echo '=== KVM-UNIT-TESTS START ==='; "
+            f"cd {kvm_tests_dir} && ACCEL=kvm ./run_tests.sh 2>&1; "
+            "echo '=== KVM-UNIT-TESTS END ==='; "
+        )
+
     exec_cmd = (
         f"{KSELFTEST_SETUP}; "
+        f"{kunit_part}"
+        "echo '=== KSELFTEST START ==='; "
         f"cd kselftest_install && {run_cmd} 2>&1 "
         "| grep -E '(^ok|^not ok|# PASS|# FAIL|# SKIP|# Totals)'; "
+        "echo '=== KSELFTEST END ==='; "
+        f"{kvm_part}"
+        f"cd /root && {stress_part}"
         "echo '=== DMESG BUGS ==='; "
         "dmesg | grep -E '(BUG:|WARNING:|UBSAN:|KASAN:|Oops:)'; "
         "echo '=== FULL DMESG ==='; "
         "dmesg"
     )
+
+    total_timeout = config.timeout_kselftest + (3900 if include_stress else 0)
     result = runner.run(kernel, exec_cmd, config, user="root", network="user",
-                        timeout=config.timeout_kselftest)
+                        timeout=total_timeout)
 
     stdout = result.stdout or ""
-    if stdout:
-        output.write_text(stdout)
-        # Save dmesg separately
-        dmesg_file = kernel.results_dir / "dmesg-kselftest.txt"
-        dmesg_marker = "=== FULL DMESG ==="
-        if dmesg_marker in stdout:
-            dmesg_content = stdout.split(dmesg_marker, 1)[1]
-            dmesg_file.write_text(dmesg_content)
-        output.write_text(stdout)
+
+    # Split kselftest output (between markers)
+    kselftest_text = stdout
+    if "=== KSELFTEST START ===" in stdout and "=== KSELFTEST END ===" in stdout:
+        kselftest_text = stdout.split("=== KSELFTEST START ===")[1].split("=== KSELFTEST END ===")[0]
+
+    # Parse kunit output if included
+    if include_kunit and "=== KUNIT START ===" in stdout and "=== KUNIT END ===" in stdout:
+        kunit_text = stdout.split("=== KUNIT START ===")[1].split("=== KUNIT END ===")[0]
+        kunit_output.write_text(kunit_text)
+
+    # Save dmesg
+    if "=== FULL DMESG ===" in stdout:
+        dmesg_content = stdout.split("=== FULL DMESG ===")[1]
+        (kernel.results_dir / "dmesg.txt").write_text(dmesg_content)
+
+    if kselftest_text:
+        output.write_text(kselftest_text)
+        print(kselftest_text[-2000:] if len(kselftest_text) > 2000 else kselftest_text)
     else:
         print("Warning: no kselftest output captured")
 
     results = _parse_kselftest_results(output)
-
-    # KASAN/Oops correlation
     results.bugs = _parse_bugs(stdout)
     if results.bugs:
         print(f"  ⚠️  {len(results.bugs)} kernel bugs detected")
+
+    # Parse stress results
+    stress_results = None
+    if include_stress and "=== STRESS START ===" in stdout and "=== STRESS END ===" in stdout:
+        stress_text = stdout.split("=== STRESS START ===")[1].split("=== STRESS END ===")[0]
+        stress_output = kernel.results_dir / "stress-ng.txt"
+        stress_output.write_text(stress_text)
+        bugs = [l for l in stress_text.splitlines()
+                if any(k in l for k in ("BUG:", "KASAN:", "UBSAN:", "Oops:"))]
+        stress_results = TestResults(
+            suite="stress-ng", passed=1 if not bugs else 0,
+            failed=len(bugs), output_file=stress_output, bugs=bugs,
+        )
+        print(f"\n--- stress-ng: {len(bugs)} bugs detected ---")
+
+    # Parse kvm-unit-tests results
+    kvm_results = None
+    if "=== KVM-UNIT-TESTS START ===" in stdout and "=== KVM-UNIT-TESTS END ===" in stdout:
+        kvm_text = stdout.split("=== KVM-UNIT-TESTS START ===")[1].split("=== KVM-UNIT-TESTS END ===")[0]
+        # Strip ANSI codes
+        kvm_text = re.sub(r'\x1b\[[0-9;]*m', '', kvm_text)
+        kvm_output = kernel.results_dir / "kvm-unit-tests.txt"
+        kvm_output.write_text(kvm_text)
+        kvm_lines = kvm_text.splitlines()
+        kvm_results = TestResults(
+            suite="kvm-unit-tests",
+            passed=sum(1 for l in kvm_lines if l.startswith("PASS")),
+            failed=sum(1 for l in kvm_lines if l.startswith("FAIL")),
+            skipped=sum(1 for l in kvm_lines if l.startswith("SKIP")),
+            output_file=kvm_output,
+            failed_tests=[l for l in kvm_lines if l.startswith("FAIL")],
+        )
 
     # Per-test retry
     if config.retry > 0 and results.failed_tests:
@@ -160,7 +242,7 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         if flaky:
             print(f"  {len(flaky)} tests marked flaky (passed on retry)")
 
-    return results
+    return results, stress_results, (_parse_kunit_results(kunit_output) if include_kunit else None), kvm_results
 
 
 def run_kvm_unit_tests(kvm_tests_dir: Path, kernel: KernelSource) -> TestResults:

@@ -207,14 +207,31 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     results: list[TestResults] = []
 
-    if suite is None or suite == "kunit":
+    if suite == "kunit":
         results.append(run_kunit(runner, kernel, config))
-    if suite is None or suite == "kselftest":
-        results.append(run_kselftest(runner, kernel, config, filter_pattern=filter_pattern))
-    if suite is None or suite == "stress":
-        results.append(run_stress(runner, kernel, config))
-    if suite is None or suite == "kvm-unit-tests":
+    elif suite == "kselftest":
+        kselftest_res, _, _, _ = run_kselftest(runner, kernel, config,
+                                               filter_pattern=filter_pattern, include_stress=False)
+        results.append(kselftest_res)
+    elif suite == "stress":
+        _, stress_res, _, _ = run_kselftest(runner, kernel, config,
+                                            filter_pattern=None, include_stress=True)
+        if stress_res:
+            results.append(stress_res)
+    elif suite == "kvm-unit-tests":
         results.append(run_kvm_unit_tests(KVM_UNIT_TESTS_DIR, kernel))
+    else:
+        # Default: single boot with kunit + kselftest + stress + kvm-unit-tests
+        kselftest_res, stress_res, kunit_res, kvm_res = run_kselftest(
+            runner, kernel, config, filter_pattern=filter_pattern,
+            include_stress=True, include_kunit=True)
+        if kunit_res:
+            results.append(kunit_res)
+        results.append(kselftest_res)
+        if stress_res:
+            results.append(stress_res)
+        if kvm_res:
+            results.append(kvm_res)
 
     if suite is None:
         upstream = fetch_upstream_failures(KCIDEV_PATH, kernel, arch=config.arch)
