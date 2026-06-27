@@ -33,6 +33,7 @@ class RunConfig:
     memory: str = "12G"
     timeout_kunit: int = 1800
     timeout_kselftest: int = 7200
+    timeout_xfstests: int = 10800
     arch: str = "x86_64"
     retry: int = 0
 

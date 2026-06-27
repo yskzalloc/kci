@@ -14,7 +14,8 @@ from pathlib import Path
 from .config import resolve_config, validate_config
 from .comparison import detect_regressions, fetch_upstream_failures, print_summary
 from .models import KernelConfig, KernelSource, RunConfig, TestResults
-from .runner import run_kunit, run_kselftest, run_kvm_unit_tests, run_stress
+from .run import (run_kunit, run_kselftest, run_kvm_unit_tests, run_stress,
+                  run_ksmbd)
 from .vm import VirtmeRunner
 
 HOME = Path.home()
@@ -155,9 +156,14 @@ def cmd_build(args: argparse.Namespace) -> None:
         "--configitem", "CONFIG_KUNIT=y",
         "--configitem", "CONFIG_KUNIT_ALL_TESTS=y",
         "--configitem", "CONFIG_KUNIT_TEST=y",
-        "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0"',
+        "--configitem", "CONFIG_DETECT_HUNG_TASK=y",
+        "--configitem", "CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=600",
+        "--configitem", "CONFIG_BOOTPARAM_HUNG_TASK_PANIC=n",
+        "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0 hung_task_panic=0 stack_depot_size=512M"',
         "--jobs", str(args.jobs),
     ]
+    for item in getattr(args, "configitem", []) or []:
+        cmd += ["--configitem", item]
     if llvm:
         cmd.append("LLVM=1")
     subprocess.run(cmd, cwd=kernel.path, check=True)
@@ -220,6 +226,9 @@ def cmd_run(args: argparse.Namespace) -> None:
             results.append(stress_res)
     elif suite == "kvm-unit-tests":
         results.append(run_kvm_unit_tests(KVM_UNIT_TESTS_DIR, kernel))
+    elif suite == "ksmbd":
+        # -f/--filter doubles as an explicit xfstests list here
+        results.append(run_ksmbd(runner, kernel, config, tests=filter_pattern))
     else:
         # Default: single boot with kunit + kselftest + stress + kvm-unit-tests
         kselftest_res, stress_res, kunit_res, kvm_res = run_kselftest(
@@ -248,7 +257,8 @@ def cmd_report(args: argparse.Namespace) -> None:
     """Generate report."""
     _check_binaries()
     kernel = _validate_kernel(args.kernel)
-    from .runner import _parse_kunit_results, _parse_kselftest_results
+    from .run import (_parse_kunit_results, _parse_kselftest_results,
+                      _parse_ksmbd_results)
 
     kernel_version = _get_kernel_version(kernel)
 
@@ -256,11 +266,14 @@ def cmd_report(args: argparse.Namespace) -> None:
     kunit_file = kernel.results_dir / "kunit.txt"
     kselftest_file = kernel.results_dir / "kselftest.txt"
     kvm_file = kernel.results_dir / "kvm-unit-tests.txt"
+    ksmbd_file = kernel.results_dir / "xfstests-ksmbd.txt"
 
     if kunit_file.exists():
         results.append(_parse_kunit_results(kunit_file))
     if kselftest_file.exists():
         results.append(_parse_kselftest_results(kselftest_file))
+    if ksmbd_file.exists():
+        results.append(_parse_ksmbd_results(ksmbd_file))
     if kvm_file.exists():
         text = kvm_file.read_text()
         lines = text.splitlines()
@@ -391,7 +404,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
     print(f"Submitting results for {kernel_version}...")
 
     # Prepare KCIDB-compatible JSON
-    from .runner import _parse_kunit_results, _parse_kselftest_results
+    from .run import _parse_kunit_results, _parse_kselftest_results
     tests = []
     kselftest_file = results_dir / "kselftest.txt"
     kunit_file = results_dir / "kunit.txt"
@@ -506,6 +519,8 @@ def main() -> None:
                          dest="skip_targets",
                          help="Skip these targets (default: non-x86 archs)")
     p_build.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
+    p_build.add_argument("-C", "--configitem", action="append", default=[],
+                         help="Extra CONFIG_FOO=y item (repeatable), e.g. CONFIG_SMB_SERVER=y")
     p_build.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
     p_build.add_argument("vars", nargs="*", help="Make variables (e.g. LLVM=1)")
 
@@ -517,7 +532,8 @@ def main() -> None:
     p_run.add_argument("-f", "--filter", help="Filter kselftest (e.g. 'net:tls')")
     p_run.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
     p_run.add_argument("--retry", type=int, default=0, help="Retry failed tests N times")
-    p_run.add_argument("suite", nargs="?", choices=["kunit", "kselftest", "kvm-unit-tests", "stress"],
+    p_run.add_argument("suite", nargs="?",
+                       choices=["kunit", "kselftest", "kvm-unit-tests", "stress", "ksmbd"],
                        help="Run specific test suite")
 
     # report

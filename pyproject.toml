@@ -20,4 +20,4 @@ kci = "kci.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-kci = ["scripts/*.sh"]
+kci = ["run/scripts/*.sh"]
