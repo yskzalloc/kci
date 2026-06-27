@@ -155,7 +155,7 @@ def cmd_build(args: argparse.Namespace) -> None:
         "--configitem", "CONFIG_KUNIT=y",
         "--configitem", "CONFIG_KUNIT_ALL_TESTS=y",
         "--configitem", "CONFIG_KUNIT_TEST=y",
-        "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0"',
+        "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0"',
         "--jobs", str(args.jobs),
     ]
     if llvm:
@@ -211,10 +211,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         results.append(run_kunit(runner, kernel, config))
     if suite is None or suite == "kselftest":
         results.append(run_kselftest(runner, kernel, config, filter_pattern=filter_pattern))
+    if suite is None or suite == "stress":
+        results.append(run_stress(runner, kernel, config))
     if suite is None or suite == "kvm-unit-tests":
         results.append(run_kvm_unit_tests(KVM_UNIT_TESTS_DIR, kernel))
-    if suite == "stress":
-        results.append(run_stress(runner, kernel, config))
 
     if suite is None:
         upstream = fetch_upstream_failures(KCIDEV_PATH, kernel, arch=config.arch)

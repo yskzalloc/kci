@@ -38,11 +38,6 @@ jobs:
           source $HOME/venv-virtme/bin/activate
           kci run -k ~/linux
 
-      - name: kci run stress
-        run: |
-          source $HOME/venv-virtme/bin/activate
-          kci run stress -k ~/linux
-
       - name: kci report
         if: always()
         run: |

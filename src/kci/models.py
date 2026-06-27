@@ -30,7 +30,7 @@ class RunConfig:
     """Runtime configuration for test execution."""
     jobs: int
     targets: str = "net bpf mm cgroup timers net/forwarding"
-    memory: str = "4G"
+    memory: str = "12G"
     timeout_kunit: int = 1800
     timeout_kselftest: int = 7200
     arch: str = "x86_64"
