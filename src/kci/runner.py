@@ -119,12 +119,12 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
     if filter_pattern:
         run_cmd = f"./run_kselftest.sh -t {filter_pattern}"
 
-    # kunit part (run kunit.py first)
+    # kunit part (kunit runs at boot via CONFIG_KUNIT, extract from dmesg)
     kunit_part = ""
     if include_kunit:
         kunit_part = (
             "echo '=== KUNIT START ==='; "
-            "cd /root && ./tools/testing/kunit/kunit.py run --raw_output 2>&1; "
+            "dmesg | grep -E '(# Totals|not ok|ok [0-9])'; "
             "echo '=== KUNIT END ==='; "
         )
 
@@ -137,7 +137,7 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         stress_ng_bin = Path.home() / "stress-ng" / "stress-ng"
         stress_part = (
             "echo '=== STRESS START ==='; "
-            f"STRESS_NG={stress_ng_bin} bash .kci-stress.sh; "
+            f"STRESS_NG={stress_ng_bin} bash .kci-stress.sh || true; "
             "echo '=== STRESS END ==='; "
         )
 
@@ -147,7 +147,7 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
     if kvm_tests_dir.exists() and (kvm_tests_dir / "x86-run").exists():
         kvm_part = (
             "echo '=== KVM-UNIT-TESTS START ==='; "
-            f"cd {kvm_tests_dir} && ACCEL=kvm ./run_tests.sh 2>&1; "
+            f"cd {kvm_tests_dir} && ACCEL=kvm ./run_tests.sh 2>&1 || true; "
             "echo '=== KVM-UNIT-TESTS END ==='; "
         )
 
@@ -155,10 +155,9 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         f"{KSELFTEST_SETUP}; "
         f"{kunit_part}"
         "echo '=== KSELFTEST START ==='; "
-        f"cd kselftest_install && {run_cmd} 2>&1 "
-        "| grep -E '(^ok|^not ok|# PASS|# FAIL|# SKIP|# Totals)'; "
+        f"cd kselftest_install && {run_cmd} 2>&1 || true; "
         "echo '=== KSELFTEST END ==='; "
-        f"{kvm_part}"
+        f"cd / && {kvm_part}"
         f"cd /root && {stress_part}"
         "echo '=== DMESG BUGS ==='; "
         "dmesg | grep -E '(BUG:|WARNING:|UBSAN:|KASAN:|Oops:)'; "
@@ -172,8 +171,13 @@ def run_kselftest(runner: VMRunner, kernel: KernelSource, config: RunConfig,
 
     stdout = result.stdout or ""
 
+    # Always save the full raw vng output
+    raw_output = kernel.results_dir / "vng-output.txt"
+    if stdout:
+        raw_output.write_text(stdout)
+
     # Split kselftest output (between markers)
-    kselftest_text = stdout
+    kselftest_text = ""
     if "=== KSELFTEST START ===" in stdout and "=== KSELFTEST END ===" in stdout:
         kselftest_text = stdout.split("=== KSELFTEST START ===")[1].split("=== KSELFTEST END ===")[0]
 

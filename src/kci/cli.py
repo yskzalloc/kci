@@ -155,7 +155,10 @@ def cmd_build(args: argparse.Namespace) -> None:
         "--configitem", "CONFIG_KUNIT=y",
         "--configitem", "CONFIG_KUNIT_ALL_TESTS=y",
         "--configitem", "CONFIG_KUNIT_TEST=y",
-        "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0"',
+        "--configitem", "CONFIG_DETECT_HUNG_TASK=y",
+        "--configitem", "CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=600",
+        "--configitem", "CONFIG_BOOTPARAM_HUNG_TASK_PANIC=n",
+        "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0 hung_task_panic=0 stack_depot_size=512M"',
         "--jobs", str(args.jobs),
     ]
     if llvm:
