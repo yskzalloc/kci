@@ -38,6 +38,12 @@ class VirtmeRunner:
         )
         if user:
             cmd += f" --user {user}"
+        # virtme passes --exec base64-encoded on the kernel command line;
+        # x86 truncates it at COMMAND_LINE_SIZE (2048), dropping root= and
+        # panicking the guest. Keep payloads in script files, not here.
+        if len(exec_cmd) > 1000:
+            print(f"Warning: --exec is {len(exec_cmd)} chars; kernel cmdline "
+                  "may be truncated (move the payload into a script file)")
         cmd += f' --exec "{exec_cmd}"'
 
         # Stream output live while capturing

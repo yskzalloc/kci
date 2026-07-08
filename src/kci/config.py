@@ -11,18 +11,32 @@ from .models import KernelConfig
 SYZKALLER_BASE_URL = "https://syzkaller.appspot.com"
 SYZKALLER_UPSTREAM_URL = f"{SYZKALLER_BASE_URL}/upstream"
 
+# Flavors map to syzbot instances tuned for each sanitizer. Notably the
+# generic (KASAN) config does not link with KMSAN instrumentation added on
+# top ("kernel image bigger than KERNEL_IMAGE_SIZE"); the dedicated KMSAN
+# config is sized for it and built daily by syzbot.
 SYZKALLER_MANAGERS = {
-    "x86_64": "ci-qemu-gce-upstream-auto",
-    "arm64": "ci-upstream-gce-arm64",
+    "x86_64": {
+        "syzkaller": "ci-qemu-gce-upstream-auto",
+        "syzkaller-kcsan": "ci2-upstream-kcsan-gce",
+        "syzkaller-kmsan": "ci-upstream-kmsan-gce-root",
+    },
+    "arm64": {
+        "syzkaller": "ci-upstream-gce-arm64",
+    },
 }
 
 
 def fetch_latest_syzkaller_config(dest: Path = Path("/tmp/kci-kernel.config"),
-                                  arch: str = "x86_64") -> Path:
+                                  arch: str = "x86_64",
+                                  flavor: str = "syzkaller") -> Path:
     """Scrape syzkaller dashboard for the latest upstream kernel config."""
-    manager = SYZKALLER_MANAGERS.get(arch)
-    if not manager:
+    managers = SYZKALLER_MANAGERS.get(arch)
+    if not managers:
         raise ValueError(f"No syzkaller config for arch: {arch}. Available: {list(SYZKALLER_MANAGERS.keys())}")
+    manager = managers.get(flavor)
+    if not manager:
+        raise ValueError(f"No syzkaller flavor '{flavor}' for {arch}. Available: {list(managers.keys())}")
 
     print(f"Fetching latest syzkaller config ({manager})...")
     with urllib.request.urlopen(SYZKALLER_UPSTREAM_URL) as response:
@@ -44,8 +58,9 @@ def fetch_latest_syzkaller_config(dest: Path = Path("/tmp/kci-kernel.config"),
 
 def resolve_config(config: KernelConfig, arch: str = "x86_64") -> Path:
     """Resolve a KernelConfig to a local file path."""
-    if config.source == "syzkaller":
-        return fetch_latest_syzkaller_config(config.resolved_path, arch=arch)
+    if config.source.startswith("syzkaller"):
+        return fetch_latest_syzkaller_config(config.resolved_path, arch=arch,
+                                             flavor=config.source)
     elif config.is_url():
         print(f"Downloading config from {config.source}...")
         subprocess.run(

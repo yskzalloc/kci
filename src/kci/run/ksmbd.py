@@ -57,7 +57,10 @@ DEFAULT_TESTS = (
 
 
 def _xfstests_dir() -> Path:
-    return Path(os.environ.get("KCI_XFSTESTS_DIR", str(Path.home() / "xfstests-dev")))
+    # resolve(): the path is embedded in the in-guest command line, where
+    # the working directory differs from the host cwd
+    return Path(os.environ.get("KCI_XFSTESTS_DIR",
+                               str(Path.home() / "xfstests-dev"))).resolve()
 
 
 def run(runner: VMRunner, kernel: KernelSource, config: RunConfig,
@@ -71,29 +74,45 @@ def run(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         sys.exit(f"Error: xfstests not found at {xfstests} "
                  "(set KCI_XFSTESTS_DIR or clone/build xfstests-dev)")
 
+    test_list = tests or DEFAULT_TESTS
+    # Parameters are baked into the script, NOT the exec string: virtme
+    # passes --exec base64-encoded on the kernel command line, and x86
+    # truncates it at COMMAND_LINE_SIZE (2048) — a long test list pushes
+    # virtme's root= off the end and the guest panics at boot.
     dest_script = kernel.path / ".kci-ksmbd.sh"
-    dest_script.write_text(SCRIPT_PATH.read_text())
+    dest_script.write_text(
+        "#!/bin/bash\n"
+        f'export XFSTESTS_DIR="{xfstests}"\n'
+        f'export TESTS="{test_list}"\n\n'
+        + SCRIPT_PATH.read_text()
+    )
     dest_script.chmod(0o755)
 
-    test_list = tests or DEFAULT_TESTS
     print("\n--- ksmbd: xfstests over cifs.ko ---")
     print(f"    xfstests: {xfstests}")
     print(f"    tests: {len(test_list.split())}")
 
-    exec_cmd = (
-        f"XFSTESTS_DIR={xfstests} TESTS='{test_list}' bash .kci-ksmbd.sh; "
-        "echo '=== FULL DMESG ==='; dmesg"
-    )
+    exec_cmd = "bash .kci-ksmbd.sh; echo '=== FULL DMESG ==='; dmesg"
     result = runner.run(kernel, exec_cmd, config, user="root", network="user",
                         timeout=config.timeout_xfstests)
 
     stdout = result.stdout or ""
+    # Split the raw vng output: xfstests-ksmbd.txt gets only the ./check
+    # output (between the script's markers), dmesg its own file, and the
+    # full unsplit stream goes to vng-output.txt for debugging.
     if stdout:
-        output.write_text(stdout)
-        (kernel.results_dir / "dmesg.txt").write_text(
-            stdout.split("=== FULL DMESG ===")[1] if "=== FULL DMESG ===" in stdout else "")
+        (kernel.results_dir / "vng-output.txt").write_text(stdout)
+    xfs_text = ""
+    if "=== XFSTESTS START ===" in stdout:
+        xfs_text = stdout.split("=== XFSTESTS START ===")[1]
+        xfs_text = xfs_text.split("=== XFSTESTS END ===")[0]
+    if xfs_text:
+        output.write_text(xfs_text)
+        print(xfs_text[-2000:] if len(xfs_text) > 2000 else xfs_text)
     else:
-        print("Warning: no xfstests output captured")
+        print("Warning: no xfstests output captured (see vng-output.txt)")
+    (kernel.results_dir / "dmesg.txt").write_text(
+        stdout.split("=== FULL DMESG ===")[1] if "=== FULL DMESG ===" in stdout else "")
 
     results = parse_results(output)
     results.bugs = parse_bugs(stdout)

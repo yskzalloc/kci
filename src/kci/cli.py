@@ -138,7 +138,11 @@ def cmd_build(args: argparse.Namespace) -> None:
     config_path = resolve_config(kconfig, arch=getattr(args, "arch", "x86_64"))
     validate_config(config_path)
 
-    llvm = "LLVM=1" if "LLVM=1" in (args.vars or []) else ""
+    # Make variables (e.g. LLVM=1) must reach EVERY make invocation below:
+    # kselftest-merge re-runs olddefconfig, and without LLVM=1 Kconfig
+    # re-evaluates compiler-dependent options with gcc — silently dropping
+    # clang-only ones like CONFIG_KMSAN from the just-built kernel's config.
+    make_vars = " ".join(args.vars or [])
 
     config_hash_file = kernel.path / ".kci-config-hash"
     current_hash = _config_hash(config_path)
@@ -151,39 +155,45 @@ def cmd_build(args: argparse.Namespace) -> None:
     cmd = [str(VNG_PATH), "--build"]
     if force:
         cmd.append("--force")
+    cmd += ["--config", str(config_path)]
+    # KUNIT on by default, but boot-time kunit runs are unwanted in some
+    # pipelines (e.g. KASAN kunit tests trigger intentional sanitizer
+    # reports); a user-provided -C CONFIG_KUNIT=... takes precedence.
+    extra_items = getattr(args, "configitem", []) or []
+    if not any(i.startswith("CONFIG_KUNIT=") for i in extra_items):
+        cmd += [
+            "--configitem", "CONFIG_KUNIT=y",
+            "--configitem", "CONFIG_KUNIT_ALL_TESTS=y",
+            "--configitem", "CONFIG_KUNIT_TEST=y",
+        ]
     cmd += [
-        "--config", str(config_path),
-        "--configitem", "CONFIG_KUNIT=y",
-        "--configitem", "CONFIG_KUNIT_ALL_TESTS=y",
-        "--configitem", "CONFIG_KUNIT_TEST=y",
         "--configitem", "CONFIG_DETECT_HUNG_TASK=y",
         "--configitem", "CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=600",
         "--configitem", "CONFIG_BOOTPARAM_HUNG_TASK_PANIC=n",
         "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0 hung_task_panic=0 stack_depot_size=512M"',
         "--jobs", str(args.jobs),
     ]
-    for item in getattr(args, "configitem", []) or []:
+    for item in extra_items:
         cmd += ["--configitem", item]
-    if llvm:
-        cmd.append("LLVM=1")
+    cmd += args.vars or []
     subprocess.run(cmd, cwd=kernel.path, check=True)
     config_hash_file.write_text(current_hash)
 
     # Merge kselftest config requirements (enables configs tests need)
     print("=== Merging kselftest config ===")
-    subprocess.run(f"make -j{args.jobs} kselftest-merge", shell=True, cwd=kernel.path, check=False)
+    subprocess.run(f"make -j{args.jobs} {make_vars} kselftest-merge", shell=True, cwd=kernel.path, check=False)
 
     print(f"=== Building kselftest ({args.targets}) ===")
-    subprocess.run(f"make -j{args.jobs} headers", shell=True, cwd=kernel.path, check=True)
+    subprocess.run(f"make -j{args.jobs} {make_vars} headers", shell=True, cwd=kernel.path, check=True)
     skip = getattr(args, "skip_targets", "")
     if args.targets == "all":
         # Full bundle: build + install everything
-        install_cmd = f"make -j{args.jobs} kselftest-install INSTALL_PATH={kernel.path}/kselftest_install"
+        install_cmd = f"make -j{args.jobs} {make_vars} kselftest-install INSTALL_PATH={kernel.path}/kselftest_install"
         if skip:
-            install_cmd = f'make -j{args.jobs} SKIP_TARGETS="{skip}" kselftest-install INSTALL_PATH={kernel.path}/kselftest_install'
+            install_cmd = f'make -j{args.jobs} {make_vars} SKIP_TARGETS="{skip}" kselftest-install INSTALL_PATH={kernel.path}/kselftest_install'
     else:
         install_cmd = (
-            f'make -C tools/testing/selftests TARGETS="{args.targets}" '
+            f'make -C tools/testing/selftests TARGETS="{args.targets}" {make_vars} '
             f"install INSTALL_PATH={kernel.path}/kselftest_install"
         )
     subprocess.run(install_cmd, shell=True, cwd=kernel.path, check=True)
