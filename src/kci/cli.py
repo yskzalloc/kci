@@ -151,30 +151,45 @@ def cmd_build(args: argparse.Namespace) -> None:
         print("Config unchanged, using incremental build (no --force)")
         force = False
 
-    print(f"=== Building kernel in {kernel.path} ===")
-    cmd = [str(VNG_PATH), "--build"]
-    if force:
-        cmd.append("--force")
-    cmd += ["--config", str(config_path)]
+    config_args = ["--config", str(config_path)]
     # KUNIT on by default, but boot-time kunit runs are unwanted in some
     # pipelines (e.g. KASAN kunit tests trigger intentional sanitizer
     # reports); a user-provided -C CONFIG_KUNIT=... takes precedence.
     extra_items = getattr(args, "configitem", []) or []
     if not any(i.startswith("CONFIG_KUNIT=") for i in extra_items):
-        cmd += [
+        config_args += [
             "--configitem", "CONFIG_KUNIT=y",
             "--configitem", "CONFIG_KUNIT_ALL_TESTS=y",
             "--configitem", "CONFIG_KUNIT_TEST=y",
         ]
-    cmd += [
+    config_args += [
         "--configitem", "CONFIG_DETECT_HUNG_TASK=y",
         "--configitem", "CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=600",
         "--configitem", "CONFIG_BOOTPARAM_HUNG_TASK_PANIC=n",
         "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0 hung_task_panic=0 stack_depot_size=512M"',
-        "--jobs", str(args.jobs),
     ]
     for item in extra_items:
-        cmd += ["--configitem", item]
+        config_args += ["--configitem", item]
+
+    # Fail fast: generate .config alone (vng --kconfig) and assert required
+    # items survived Kconfig dependency resolution BEFORE the long build.
+    required = getattr(args, "require", []) or []
+    if required:
+        print("=== Generating .config (vng --kconfig) ===")
+        subprocess.run([str(VNG_PATH), "--kconfig"] + config_args + (args.vars or []),
+                       cwd=kernel.path, check=True)
+        conf_lines = (kernel.path / ".config").read_text().splitlines()
+        missing = [r for r in required if r not in conf_lines]
+        if missing:
+            sys.exit("Error: dropped by Kconfig (unmet dependencies?): "
+                     + ", ".join(missing))
+        print(f"required config items present: {', '.join(required)}")
+
+    print(f"=== Building kernel in {kernel.path} ===")
+    cmd = [str(VNG_PATH), "--build"]
+    if force:
+        cmd.append("--force")
+    cmd += config_args + ["--jobs", str(args.jobs)]
     cmd += args.vars or []
     subprocess.run(cmd, cwd=kernel.path, check=True)
     config_hash_file.write_text(current_hash)
@@ -531,6 +546,9 @@ def main() -> None:
     p_build.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
     p_build.add_argument("-C", "--configitem", action="append", default=[],
                          help="Extra CONFIG_FOO=y item (repeatable), e.g. CONFIG_SMB_SERVER=y")
+    p_build.add_argument("-R", "--require", action="append", default=[],
+                         help="Assert CONFIG_FOO=y survived in .config (via vng --kconfig) "
+                              "before building (repeatable)")
     p_build.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
     p_build.add_argument("vars", nargs="*", help="Make variables (e.g. LLVM=1)")
 

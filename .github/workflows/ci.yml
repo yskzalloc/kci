@@ -125,6 +125,7 @@ jobs:
           clang --version | head -1
           kci build -k smb3-kernel -t filesystems \
             -c ${{ matrix.config }} \
+            -R ${{ matrix.config_check }} \
             -C CONFIG_KUNIT=n \
             -C CONFIG_CIFS=y \
             -C CONFIG_CIFS_XATTR=y \
