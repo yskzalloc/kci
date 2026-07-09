@@ -28,13 +28,19 @@ jobs:
               -C CONFIG_KCSAN_EARLY_ENABLE=y
               -C CONFIG_KFENCE=y
             config_check: CONFIG_KCSAN=y
-          - sanitizer: kmsan
-            config: syzkaller-kmsan
-            configitems: >-
-              -C CONFIG_KFENCE=y
-            config_check: CONFIG_KMSAN=y
+          # kmsan leg deactivated for now (too slow for the 6h job limit);
+          # uncomment to re-enable.
+          # - sanitizer: kmsan
+          #   config: syzkaller-kmsan
+          #   configitems: >-
+          #     -C CONFIG_KFENCE=y
+          #   config_check: CONFIG_KMSAN=y
     name: ksmbd-xfstests (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
+    # GitHub-hosted maximum; the vng timeout (timeout_xfstests, 4h) is
+    # budgeted to fit inside it so reporting/uploads still run after a
+    # sanitizer-slow leg exhausts the VM time.
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -66,6 +72,10 @@ jobs:
             libnl-3-dev libnl-genl-3-dev libglib2.0-dev \
             xfslibs-dev xfsprogs e2fsprogs uuid-dev uuid-runtime \
             libattr1-dev libacl1-dev libaio-dev libgdbm-dev libgdbm-compat-dev liburing-dev
+          # xfstests secondary users; must exist on the host — useradd cannot
+          # lock the virtiofs-shared /etc/passwd from inside the guest
+          sudo useradd -m fsgqa || true
+          sudo useradd 123456-fsgqa || true
 
       # Latest LLVM snapshot from apt.llvm.org (llvm-toolchain-noble = trunk);
       # packages are versioned (clang-N), so prepend /usr/lib/llvm-N/bin to
@@ -153,14 +163,43 @@ jobs:
           export KCI_XFSTESTS_DIR=$GITHUB_WORKSPACE/xfstests-dev
           kci run -k smb3-kernel ksmbd
 
+      # Individual test failures must NOT fail the job (they are reported
+      # instead); only a broken harness — xfstests never reached its
+      # summary line (boot panic, mount failure) — is a CI failure.
+      - name: Verify xfstests completed
+        run: |
+          grep -qE "^(Failed [0-9]+ of|Passed all)" smb3-kernel/test-results/xfstests-ksmbd.txt 2>/dev/null && exit 0
+          echo "::error::xfstests never completed — guest environment failure. Last guest output:"
+          tail -80 smb3-kernel/test-results/vng-output.txt 2>/dev/null || echo "(no vng output at all — VM did not boot?)"
+          exit 1
+
       - name: Show results
         if: always()
         run: |
           echo "=== XFSTESTS SUMMARY ==="
           grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" smb3-kernel/test-results/xfstests-ksmbd.txt 2>/dev/null || echo "(no summary)"
           echo ""
+          echo "=== FAILED TEST DETAILS ==="
+          cat smb3-kernel/test-results/xfstests-failures.txt 2>/dev/null || echo "(no report)"
+          echo ""
           echo "=== KERNEL DMESG BUGS ==="
           grep -E "(BUG:|KASAN:|KCSAN:|KMSAN:|UBSAN:|Oops:|WARNING:)" smb3-kernel/test-results/dmesg.txt 2>/dev/null || echo "(none)"
+          {
+            echo "## xfstests over ksmbd (${{ matrix.sanitizer }})"
+            echo '```'
+            grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" smb3-kernel/test-results/xfstests-ksmbd.txt 2>/dev/null || echo "xfstests did not complete"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload xfstests results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfstests-results-${{ matrix.sanitizer }}
+          path: |
+            smb3-kernel/test-results/xfstests-ksmbd.txt
+            smb3-kernel/test-results/xfstests-failures.txt
+            smb3-kernel/test-results/xfstests-results/
 
       - name: Upload results
         if: always()

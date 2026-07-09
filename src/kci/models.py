@@ -30,10 +30,16 @@ class RunConfig:
     """Runtime configuration for test execution."""
     jobs: int
     targets: str = "net bpf mm cgroup timers net/forwarding"
-    memory: str = "12G"
+    # VM size: GitHub-hosted runners have 4 vCPUs / 16GB RAM, so give the
+    # guest 4 CPUs and 14GB (leave ~2GB for the host side).
+    memory: str = "14G"
+    cpus: int = 4
     timeout_kunit: int = 1800
     timeout_kselftest: int = 7200
-    timeout_xfstests: int = 10800
+    # GitHub-hosted jobs die hard at 360 min (nothing after — no artifact
+    # upload), so budget inside it: ~1.5h toolchain+sanitizer build leaves
+    # 4h for the VM; KASAN/KMSAN legs need every bit of it.
+    timeout_xfstests: int = 14400
     arch: str = "x86_64"
     retry: int = 0
 

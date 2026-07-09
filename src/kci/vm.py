@@ -33,7 +33,7 @@ class VirtmeRunner:
             timeout: int = 7200) -> subprocess.CompletedProcess:
         cmd = (
             f"timeout {timeout} {self.vng} --rw --verbose "
-            f"--memory {config.memory} --cpus {config.jobs} "
+            f"--memory {config.memory} --cpus {config.cpus} "
             f"--append 'panic_on_warn=0' --network {network}"
         )
         if user:
