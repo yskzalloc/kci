@@ -2,56 +2,17 @@ name: KCI Tests
 
 on:
   push:
-    branches: [ksmbd-for-next-next]
+    branches: [main]
   pull_request:
   schedule:
-    - cron: '0 12 * * *'
+    - cron: '0 4 * * *'
 
 jobs:
-  # One parallel leg per sanitizer, each using the syzbot instance config
-  # tuned for that sanitizer (flipping KMSAN on in the generic KASAN
-  # config does not link: "kernel image bigger than KERNEL_IMAGE_SIZE").
-  # KFENCE: off next to full KASAN coverage, on for kcsan/kmsan legs.
-  ksmbd-xfstests:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - sanitizer: kasan
-            config: syzkaller
-            configitems: >-
-              -C CONFIG_KFENCE=n
-            config_check: CONFIG_KASAN=y
-          - sanitizer: kcsan
-            config: syzkaller-kcsan
-            configitems: >-
-              -C CONFIG_KCSAN_EARLY_ENABLE=y
-              -C CONFIG_KFENCE=y
-            config_check: CONFIG_KCSAN=y
-          # kmsan leg deactivated for now (too slow for the 6h job limit);
-          # uncomment to re-enable.
-          # - sanitizer: kmsan
-          #   config: syzkaller-kmsan
-          #   configitems: >-
-          #     -C CONFIG_KFENCE=y
-          #   config_check: CONFIG_KMSAN=y
-    name: ksmbd-xfstests (${{ matrix.sanitizer }})
+  test:
     runs-on: ubuntu-latest
-    # GitHub-hosted maximum; the vng timeout (timeout_xfstests, 4h) is
-    # budgeted to fit inside it so reporting/uploads still run after a
-    # sanitizer-slow leg exhausts the VM time.
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-
-      # First thing after checkout: everything below (toolchains, clones,
-      # sanitizer kernel build, xfstests exports) shares this filesystem,
-      # and a KASAN/KMSAN build with debug info alone can eat 15-25GB.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h /
 
       - name: Enable KVM
         run: |
@@ -65,145 +26,55 @@ jobs:
       - name: kci init
         run: kci init
 
-      - name: Install ksmbd-tools and xfstests build deps
-        run: |
-          sudo apt install -y -qq cifs-utils attr quota fio dbench \
-            autoconf automake libtool libtool-bin pkg-config gawk sqlite3 \
-            libnl-3-dev libnl-genl-3-dev libglib2.0-dev \
-            xfslibs-dev xfsprogs e2fsprogs uuid-dev uuid-runtime \
-            libattr1-dev libacl1-dev libaio-dev libgdbm-dev libgdbm-compat-dev liburing-dev
-          # xfstests secondary users; must exist on the host — useradd cannot
-          # lock the virtiofs-shared /etc/passwd from inside the guest
-          sudo useradd -m fsgqa || true
-          sudo useradd 123456-fsgqa || true
-
-      # Latest LLVM snapshot from apt.llvm.org (llvm-toolchain-noble = trunk);
-      # packages are versioned (clang-N), so prepend /usr/lib/llvm-N/bin to
-      # PATH where the unversioned clang/ld.lld/llvm-* live, for LLVM=1 builds.
-      - name: Install latest LLVM toolchain
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt-llvm-org.asc >/dev/null
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble main" | sudo tee /etc/apt/sources.list.d/apt-llvm-org.list
-          echo "deb-src http://apt.llvm.org/noble/ llvm-toolchain-noble main" | sudo tee -a /etc/apt/sources.list.d/apt-llvm-org.list
-          sudo apt-get update -qq
-          # kmsan leg: trunk snapshots can regress -fsanitize=kernel-memory,
-          # which makes Kconfig drop HAVE_KMSAN_COMPILER (and thus KMSAN)
-          # silently; walk down from the newest clang until the probe passes.
-          PROBE=""
-          [ "${{ matrix.sanitizer }}" = "kmsan" ] && PROBE="-fsanitize=kernel-memory"
-          for LLVM_VER in $(apt-cache search --names-only '^clang-[0-9]+$' | awk -F'[- ]' '{print $2}' | sort -rn); do
-            sudo apt-get install -y -qq clang-$LLVM_VER lld-$LLVM_VER llvm-$LLVM_VER
-            if [ -z "$PROBE" ] || /usr/lib/llvm-$LLVM_VER/bin/clang -Werror $PROBE -S -x c /dev/null -o /dev/null 2>/dev/null; then
-              break
-            fi
-            echo "clang-$LLVM_VER lacks $PROBE support, trying older"
-          done
-          echo "/usr/lib/llvm-$LLVM_VER/bin" >> $GITHUB_PATH
-          /usr/lib/llvm-$LLVM_VER/bin/clang --version
-
-      - name: Checkout ksmbd-tools
-        uses: actions/checkout@v4
-        with:
-          repository: cifsd-team/ksmbd-tools
-          path: ksmbd-tools
-
-      - name: Build and install ksmbd-tools
-        run: |
-          cd ksmbd-tools
-          ./autogen.sh
-          ./configure --sysconfdir=/etc --with-rundir=/run
-          make CC=clang -j`nproc`
-          sudo make install
-
-      # xfstests is hosted on git.kernel.org; actions/checkout can only
-      # fetch GitHub repositories, so plain git clone stays here.
-      - name: Build xfstests
-        run: |
-          git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
-          make -j`nproc` -C xfstests-dev
-
-      - name: Checkout ksmbd kernel
-        uses: actions/checkout@v4
-        with:
-          repository: smfrench/smb3-kernel
-          ref: ksmbd-for-next-next
-          path: smb3-kernel
+      - name: Clone upstream kernel
+        run: git clone --depth 1 https://github.com/torvalds/linux.git ~/linux
 
       - name: kci build
         run: |
           source $HOME/venv-virtme/bin/activate
-          clang --version | head -1
-          kci build -k smb3-kernel -t filesystems \
-            -c ${{ matrix.config }} \
-            -R ${{ matrix.config_check }} \
-            -C CONFIG_KUNIT=n \
-            -C CONFIG_CIFS=y \
-            -C CONFIG_CIFS_XATTR=y \
-            -C CONFIG_CIFS_POSIX=y \
-            -C CONFIG_CIFS_ALLOW_INSECURE_LEGACY=y \
-            -C CONFIG_CIFS_DEBUG=y \
-            -C CONFIG_SMB_SERVER=y \
-            -C CONFIG_SMB_SERVER_CHECK_CAP_NET_ADMIN=y \
-            ${{ matrix.configitems }} \
-            LLVM=1
+          kci build -k ~/linux LLVM=1
 
-      # olddefconfig drops sanitizer options whose dependencies are unmet;
-      # fail loudly instead of silently testing an unsanitized kernel,
-      # and dump the dependency state so the cause is visible in the log.
-      - name: Verify ${{ matrix.sanitizer }} is enabled
-        run: |
-          grep -x "${{ matrix.config_check }}" smb3-kernel/.config && exit 0
-          echo "::error::${{ matrix.sanitizer }} was dropped by olddefconfig; dependency state:"
-          grep -E "CONFIG_(CC_IS_CLANG|CC_VERSION_TEXT|HAVE_ARCH_KMSAN|HAVE_KMSAN_COMPILER|HAVE_ARCH_KCSAN|HAVE_KCSAN_COMPILER|DEBUG_KERNEL|PREEMPT_RT|KASAN|KCSAN|KMSAN|KFENCE)[= ]" smb3-kernel/.config || true
-          exit 1
-
-      - name: kci run ksmbd
+      - name: kci run
         run: |
           source $HOME/venv-virtme/bin/activate
-          export KCI_XFSTESTS_DIR=$GITHUB_WORKSPACE/xfstests-dev
-          kci run -k smb3-kernel ksmbd
+          kci run -k ~/linux
 
-      # Individual test failures must NOT fail the job (they are reported
-      # instead); only a broken harness — xfstests never reached its
-      # summary line (boot panic, mount failure) — is a CI failure.
-      - name: Verify xfstests completed
-        run: |
-          grep -qE "^(Failed [0-9]+ of|Passed all)" smb3-kernel/test-results/xfstests-ksmbd.txt 2>/dev/null && exit 0
-          echo "::error::xfstests never completed — guest environment failure. Last guest output:"
-          tail -80 smb3-kernel/test-results/vng-output.txt 2>/dev/null || echo "(no vng output at all — VM did not boot?)"
-          exit 1
-
-      - name: Show results
+      - name: kci report
         if: always()
         run: |
-          echo "=== XFSTESTS SUMMARY ==="
-          grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" smb3-kernel/test-results/xfstests-ksmbd.txt 2>/dev/null || echo "(no summary)"
+          source $HOME/venv-virtme/bin/activate
+          kci report -k ~/linux
+
+      - name: Show detailed results
+        if: always()
+        run: |
+          echo "=== REPORT ==="
+          cat /tmp/kci-report.md
           echo ""
-          echo "=== FAILED TEST DETAILS ==="
-          cat smb3-kernel/test-results/xfstests-failures.txt 2>/dev/null || echo "(no report)"
+          echo "=== KUNIT FAILURES ==="
+          grep "not ok" ~/linux/test-results/kunit.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== KSELFTEST ALL FAILURES ==="
+          grep "^not ok" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== KSELFTEST SUMMARY (per suite) ==="
+          grep "# Totals" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== KVM-UNIT-TESTS FAILURES ==="
+          grep "^FAIL" ~/linux/test-results/kvm-unit-tests.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== STRESS-NG BUGS ==="
+          grep -E "(BUG:|KASAN:|UBSAN:|Oops:)" ~/linux/test-results/stress-ng.txt 2>/dev/null || echo "(none)"
           echo ""
           echo "=== KERNEL DMESG BUGS ==="
-          grep -E "(BUG:|KASAN:|KCSAN:|KMSAN:|UBSAN:|Oops:|WARNING:)" smb3-kernel/test-results/dmesg.txt 2>/dev/null || echo "(none)"
-          {
-            echo "## xfstests over ksmbd (${{ matrix.sanitizer }})"
-            echo '```'
-            grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" smb3-kernel/test-results/xfstests-ksmbd.txt 2>/dev/null || echo "xfstests did not complete"
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload xfstests results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xfstests-results-${{ matrix.sanitizer }}
-          path: |
-            smb3-kernel/test-results/xfstests-ksmbd.txt
-            smb3-kernel/test-results/xfstests-failures.txt
-            smb3-kernel/test-results/xfstests-results/
+          grep -E "(BUG:|KASAN:|UBSAN:|Oops:|WARNING:)" ~/linux/test-results/dmesg.txt 2>/dev/null || echo "(none)"
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ksmbd-test-results-${{ matrix.sanitizer }}
-          path: smb3-kernel/test-results/
+          name: test-results
+          path: |
+            ~/linux/test-results/
+            /tmp/kci-report.md
+            /tmp/kci-report.json
