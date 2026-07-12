@@ -2,10 +2,10 @@ name: KCI Tests
 
 on:
   push:
-    branches: [main]
+    branches: [dept]
   pull_request:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 17 * * *'
 
 jobs:
   test:
@@ -26,13 +26,31 @@ jobs:
       - name: kci init
         run: kci init
 
-      - name: Clone upstream kernel
-        run: git clone --depth 1 https://github.com/torvalds/linux.git ~/linux
+      - name: Clone DEPT kernel
+        run: git clone -b dept19_v7.0 --depth 1 https://github.com/maxbyungchulpark/linux-dept.git ~/linux
 
+      # CONFIG_DEPT (lib/Kconfig.debug) selects everything else it needs
+      # (PROVE_LOCKING, DEBUG_SPINLOCK/MUTEXES/RWSEMS, TRACE_IRQFLAGS, ...);
+      # -R makes kci fail fast if olddefconfig drops it.
       - name: kci build
         run: |
           source $HOME/venv-virtme/bin/activate
-          kci build -k ~/linux LLVM=1
+          kci build -k ~/linux \
+            -C CONFIG_DEPT=y \
+            -C CONFIG_DEPT_AGGRESSIVE_TIMEOUT_WAIT=y \
+            -C CONFIG_DEPT_UNIT_TEST=m \
+            -R CONFIG_DEPT=y \
+            LLVM=1
+
+      # olddefconfig drops options whose dependencies are unmet; fail loudly
+      # instead of silently testing a DEPT-less kernel, and dump the
+      # dependency state so the cause is visible in the log.
+      - name: Verify DEPT is enabled
+        run: |
+          grep -x "CONFIG_DEPT=y" ~/linux/.config && exit 0
+          echo "::error::CONFIG_DEPT was dropped by olddefconfig; dependency state:"
+          grep -E "CONFIG_(DEBUG_KERNEL|LOCK_DEBUGGING_SUPPORT|TRACE_IRQFLAGS_SUPPORT|STACKTRACE_SUPPORT|LOCKDEP_SUPPORT|PROVE_LOCKING|DEPT)[= ]" ~/linux/.config || true
+          exit 1
 
       - name: kci run
         run: |
@@ -64,10 +82,13 @@ jobs:
           grep "^FAIL" ~/linux/test-results/kvm-unit-tests.txt 2>/dev/null || echo "(none)"
           echo ""
           echo "=== STRESS-NG BUGS ==="
-          grep -E "(BUG:|KASAN:|UBSAN:|Oops:)" ~/linux/test-results/stress-ng.txt 2>/dev/null || echo "(none)"
+          grep -E "(BUG:|KASAN:|UBSAN:|Oops:|DEPT:)" ~/linux/test-results/stress-ng.txt 2>/dev/null || echo "(none)"
           echo ""
           echo "=== KERNEL DMESG BUGS ==="
-          grep -E "(BUG:|KASAN:|UBSAN:|Oops:|WARNING:)" ~/linux/test-results/dmesg.txt 2>/dev/null || echo "(none)"
+          grep -E "(BUG:|KASAN:|UBSAN:|Oops:|WARNING:|DEPT:)" ~/linux/test-results/dmesg.txt 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== DEPT REPORTS ==="
+          grep -B2 -A40 "DEPT: Circular dependency has been detected" ~/linux/test-results/*.txt 2>/dev/null || echo "(none)"
 
       - name: Upload results
         if: always()
