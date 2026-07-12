@@ -37,12 +37,17 @@ jobs:
             config_check: CONFIG_KMSAN=y
           # RT legs: same sanitizer configs with the locking layer swapped
           # to the PREEMPT_RT variants (EXPERT=y unlocks the RT prompt).
+          # SCTP is off for now: DEPT+RT bloat pushes sctp_association's
+          # rcu_head past kfree_rcu()'s 4096-byte offset limit (build
+          # failure in net/sctp/associola.c); re-enable once the dept
+          # branch moves the rcu field or converts to call_rcu().
           - sanitizer: kasan-rt
             config: syzkaller
             configitems: >-
               -C CONFIG_KFENCE=n
               -C CONFIG_EXPERT=y
               -C CONFIG_PREEMPT_RT=y
+              -C CONFIG_IP_SCTP=n
             config_check: CONFIG_KASAN=y CONFIG_PREEMPT_RT=y
           - sanitizer: kcsan-rt
             config: syzkaller-kcsan
@@ -51,6 +56,7 @@ jobs:
               -C CONFIG_KFENCE=y
               -C CONFIG_EXPERT=y
               -C CONFIG_PREEMPT_RT=y
+              -C CONFIG_IP_SCTP=n
             config_check: CONFIG_KCSAN=y CONFIG_PREEMPT_RT=y
     name: test (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
