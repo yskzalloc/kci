@@ -161,12 +161,28 @@ def cmd_build(args: argparse.Namespace) -> None:
             "--configitem", "CONFIG_KUNIT=y",
             "--configitem", "CONFIG_KUNIT_ALL_TESTS=y",
             "--configitem", "CONFIG_KUNIT_TEST=y",
+            # KUNIT_ALL_TESTS force-enables every test (their prompts are
+            # guarded by "if !KUNIT_ALL_TESTS", so a per-test =n is ignored);
+            # KUNIT_CASE_SLOW cases (e.g. binder_alloc exhaustive) run 10+
+            # minutes under sanitizers and trip the hung-task watchdog on
+            # the boot-time run — skip slow cases instead.
+            "--configitem", 'CONFIG_KUNIT_DEFAULT_FILTER="speed>slow"',
+            "--configitem", 'CONFIG_KUNIT_DEFAULT_FILTER_ACTION="skip"',
         ]
     config_args += [
         "--configitem", "CONFIG_DETECT_HUNG_TASK=y",
         "--configitem", "CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=600",
-        "--configitem", "CONFIG_BOOTPARAM_HUNG_TASK_PANIC=n",
-        "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0 hung_task_panic=0 stack_depot_size=512M"',
+        # BOOTPARAM_HUNG_TASK_PANIC is an int now (number of hung tasks that
+        # triggers panic); "=n" is an invalid int, which kconfig silently
+        # drops, leaving the syzbot config's =1 to panic the guest during
+        # boot-time hangs. 0 = report but never panic. The old
+        # hung_task_panic= boot param no longer exists (sysctl only), so the
+        # config value is the only pre-userspace knob.
+        "--configitem", "CONFIG_BOOTPARAM_HUNG_TASK_PANIC=0",
+        # stack_depot_max_pools: 16KB pools, allocated lazily; 32768 caps the
+        # depot at 512MB (the 8192/128MB default overflows under KASAN+DEPT,
+        # "Stack depot reached limit capacity").
+        "--configitem", 'CONFIG_CMDLINE="earlyprintk=serial net.ifnames=0 panic_on_warn=0 stack_depot_max_pools=32768"',
     ]
     for item in extra_items:
         config_args += ["--configitem", item]
