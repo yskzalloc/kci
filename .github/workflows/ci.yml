@@ -131,6 +131,20 @@ jobs:
           source $HOME/venv-virtme/bin/activate
           kci report -k ~/linux
 
+      # KCIDB I/O v5.3 report (checkout -> build -> tests); lands in
+      # test-results/kcidb-submission.json inside the uploaded artifact.
+      # Submission to KCIDB itself waits on an origin/token from the
+      # KernelCI maintainers (kci submit).
+      - name: Generate KCIDB submission
+        if: always()
+        run: |
+          if [ -d ~/linux/test-results ]; then
+            kci kcidb -k ~/linux --config-name dept-${{ matrix.sanitizer }}
+            head -c 2000 ~/linux/test-results/kcidb-submission.json
+          else
+            echo "no test results; skipping KCIDB export"
+          fi
+
       - name: Show detailed results
         if: always()
         run: |

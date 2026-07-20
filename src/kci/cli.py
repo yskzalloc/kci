@@ -426,6 +426,35 @@ def _notify_github(regressions: list[str], kernel_version: str, arch: str) -> No
         print(f"  GitHub notification skipped: {e}")
 
 
+def _generate_kcidb(args: argparse.Namespace, kernel: KernelSource) -> Path:
+    """Generate the KCIDB submission JSON, return its path."""
+    from .kcidb import generate_submission
+
+    submission = generate_submission(
+        kernel,
+        origin=getattr(args, "origin", None) or "kci",
+        config_name=getattr(args, "config_name", None)
+            or os.environ.get("KCI_CONFIG_NAME"),
+        tree_name=getattr(args, "tree", None),
+        arch=getattr(args, "arch", "x86_64"),
+    )
+    out = getattr(args, "output", None)
+    json_path = Path(out) if out else kernel.results_dir / "kcidb-submission.json"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(submission, indent=2) + "\n")
+    n = len(submission["tests"])
+    print(f"KCIDB submission ({n} tests, 1 build, 1 checkout): {json_path}")
+    return json_path
+
+
+def cmd_kcidb(args: argparse.Namespace) -> None:
+    """Export results as a KCIDB report (no submission)."""
+    kernel = _validate_kernel(args.kernel)
+    if not kernel.results_dir.exists() or not any(kernel.results_dir.iterdir()):
+        sys.exit("Error: no test results found. Run tests first: kci run")
+    _generate_kcidb(args, kernel)
+
+
 def cmd_submit(args: argparse.Namespace) -> None:
     """Submit results to KCIDB."""
     _check_binaries()
@@ -444,27 +473,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
     kernel_version = _get_kernel_version(kernel)
     print(f"Submitting results for {kernel_version}...")
 
-    # Prepare KCIDB-compatible JSON
-    from .run import _parse_kunit_results, _parse_kselftest_results
-    tests = []
-    kselftest_file = results_dir / "kselftest.txt"
-    kunit_file = results_dir / "kunit.txt"
-
-    for fpath, suite in [(kunit_file, "kunit"), (kselftest_file, "kselftest")]:
-        if fpath.exists():
-            parse_fn = _parse_kunit_results if suite == "kunit" else _parse_kselftest_results
-            r = parse_fn(fpath)
-            tests.append({
-                "id": f"kci:{suite}:{kernel_version}",
-                "build_id": f"kci:build:{kernel_version}",
-                "path": suite,
-                "status": "PASS" if r.failed == 0 else "FAIL",
-                "start_time": datetime.now().isoformat(),
-            })
-
-    submission = {"version": {"major": 4, "minor": 3}, "tests": tests}
-    json_path = results_dir / "kcidb-submission.json"
-    json_path.write_text(json.dumps(submission, indent=2) + "\n")
+    json_path = _generate_kcidb(args, kernel)
 
     # Try kci-dev submit
     result = subprocess.run(
@@ -586,9 +595,26 @@ def main() -> None:
     p_report.add_argument("--json", action="store_true", help="Output JSON instead of Markdown")
     p_report.add_argument("--arch", default="x86_64")
 
-    # submit
+    # kcidb / submit — shared KCIDB report options
+    def _add_kcidb_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("-k", "--kernel", default=str(HOME / "net"))
+        p.add_argument("--origin", default="kci",
+                       help="KCIDB origin (assigned by KernelCI maintainers)")
+        p.add_argument("--config-name", dest="config_name",
+                       default=os.environ.get("KCI_CONFIG_NAME"),
+                       help="Kernel config name, e.g. the CI matrix leg "
+                            "(default: $KCI_CONFIG_NAME)")
+        p.add_argument("--tree", help="tree_name (default: derived from git remote)")
+        p.add_argument("--arch", default="x86_64")
+
+    p_kcidb = sub.add_parser(
+        "kcidb", help="Export results as KCIDB report JSON (checkouts/builds/tests)")
+    _add_kcidb_args(p_kcidb)
+    p_kcidb.add_argument("-o", "--output",
+                         help="Output path (default: <results>/kcidb-submission.json)")
+
     p_submit = sub.add_parser("submit", help="Submit results to KCIDB")
-    p_submit.add_argument("-k", "--kernel", default=str(HOME / "net"))
+    _add_kcidb_args(p_submit)
 
     # notify
     p_notify = sub.add_parser("notify", help="GitHub notification on regression")
@@ -612,6 +638,7 @@ def main() -> None:
         "build": cmd_build,
         "run": cmd_run,
         "report": cmd_report,
+        "kcidb": cmd_kcidb,
         "submit": cmd_submit,
         "notify": cmd_notify,
         "bisect": cmd_bisect,
