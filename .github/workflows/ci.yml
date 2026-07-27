@@ -120,10 +120,13 @@ jobs:
           grep -E "CONFIG_(CC_IS_CLANG|CC_VERSION_TEXT|HAVE_ARCH_KMSAN|HAVE_KMSAN_COMPILER|HAVE_ARCH_KCSAN|HAVE_KCSAN_COMPILER|DEBUG_KERNEL|EXPERT|ARCH_SUPPORTS_RT|PREEMPT_RT|KASAN|KCSAN|KMSAN|KFENCE|LOCK_DEBUGGING_SUPPORT|TRACE_IRQFLAGS_SUPPORT|STACKTRACE_SUPPORT|LOCKDEP_SUPPORT|PROVE_LOCKING|DEPT)[= ]" ~/linux/.config || true
           exit 1
 
+      # Runs kselftest + kvm-unit-tests + stress-ng in one boot. Boot-time
+      # kunit is off by default (guest boots with kunit.enable=0, config
+      # untouched); run "kci run kunit" to opt back in.
       - name: kci run
         run: |
           source $HOME/venv-virtme/bin/activate
-          kci run -k ~/linux
+          kci run -k ~/linux stress-ng kselftest kvm-unit-tests
 
       - name: kci report
         if: always()
@@ -150,9 +153,6 @@ jobs:
         run: |
           echo "=== REPORT ==="
           cat /tmp/kci-report.md
-          echo ""
-          echo "=== KUNIT FAILURES ==="
-          grep "not ok" ~/linux/test-results/kunit.txt 2>/dev/null || echo "(none)"
           echo ""
           echo "=== KSELFTEST ALL FAILURES ==="
           grep "^not ok" ~/linux/test-results/kselftest.txt 2>/dev/null || echo "(none)"

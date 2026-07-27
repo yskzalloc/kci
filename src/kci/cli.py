@@ -14,8 +14,7 @@ from pathlib import Path
 from .config import resolve_config, validate_config
 from .comparison import detect_regressions, fetch_upstream_failures, print_summary
 from .models import KernelConfig, KernelSource, RunConfig, TestResults
-from .run import (run_kunit, run_kselftest, run_kvm_unit_tests, run_stress,
-                  run_ksmbd)
+from .run import run_kunit, run_kselftest, run_ksmbd
 from .vm import VirtmeRunner
 
 HOME = Path.home()
@@ -238,52 +237,66 @@ def cmd_build(args: argparse.Namespace) -> None:
     print("\nbuild done.")
 
 
+DEFAULT_SUITES = ["kselftest", "kvm-unit-tests", "stress-ng"]
+KNOWN_SUITES = ["kunit", "kselftest", "kvm-unit-tests", "stress-ng", "ksmbd"]
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Run tests."""
     _check_binaries()
     kernel = _validate_kernel(args.kernel)
+    suites = getattr(args, "suite", None) or []
+    unknown = set(suites) - set(KNOWN_SUITES)
+    if unknown:
+        sys.exit(f"Error: unknown suite(s): {' '.join(sorted(unknown))} "
+                 f"(choose from: {' '.join(KNOWN_SUITES)})")
+    default_run = not suites
+    # dedupe, keeping the order given on the command line
+    ordered = list(dict.fromkeys(suites)) if suites else list(DEFAULT_SUITES)
+    filter_pattern = getattr(args, "filter", None)
     config = RunConfig(
         jobs=args.jobs,
         targets=args.targets,
         arch=getattr(args, "arch", "x86_64"),
         retry=getattr(args, "retry", 0),
+        # Boot-time kunit is opt-in via the suite argument ("kci run kunit");
+        # any other run boots with kunit.enable=0, which keeps the kunit
+        # tests built but stops the in-kernel executor from running them at
+        # boot (lib/kunit/test.c enable_param).
+        append=[] if "kunit" in ordered else ["kunit.enable=0"],
     )
     runner = VirtmeRunner(VNG_PATH)
-    suite = getattr(args, "suite", None)
-    filter_pattern = getattr(args, "filter", None)
 
     results: list[TestResults] = []
 
-    if suite == "kunit":
-        results.append(run_kunit(runner, kernel, config))
-    elif suite == "kselftest":
-        kselftest_res, _, _, _ = run_kselftest(runner, kernel, config,
-                                               filter_pattern=filter_pattern, include_stress=False)
-        results.append(kselftest_res)
-    elif suite == "stress":
-        _, stress_res, _, _ = run_kselftest(runner, kernel, config,
-                                            filter_pattern=None, include_stress=True)
-        if stress_res:
-            results.append(stress_res)
-    elif suite == "kvm-unit-tests":
-        results.append(run_kvm_unit_tests(KVM_UNIT_TESTS_DIR, kernel))
-    elif suite == "ksmbd":
-        # -f/--filter doubles as an explicit xfstests list here
-        results.append(run_ksmbd(runner, kernel, config, tests=filter_pattern))
-    else:
-        # Default: single boot with kunit + kselftest + stress + kvm-unit-tests
-        kselftest_res, stress_res, kunit_res, kvm_res = run_kselftest(
-            runner, kernel, config, filter_pattern=filter_pattern,
-            include_stress=True, include_kunit=True)
-        if kunit_res:
-            results.append(kunit_res)
-        results.append(kselftest_res)
-        if stress_res:
-            results.append(stress_res)
-        if kvm_res:
-            results.append(kvm_res)
+    # ksmbd needs its own boot (xfstests); it runs before the shared boot
+    # when listed first, otherwise after it.
+    # -f/--filter doubles as an explicit xfstests list for it.
+    ksmbd_first = ordered and ordered[0] == "ksmbd"
+    shared = [s for s in ordered if s != "ksmbd"]
 
-    if suite is None:
+    if "ksmbd" in ordered and ksmbd_first:
+        results.append(run_ksmbd(runner, kernel, config, tests=filter_pattern))
+
+    if shared == ["kunit"]:
+        # kunit alone gets the dedicated kunit.py run
+        results.append(run_kunit(runner, kernel, config))
+    elif shared:
+        # everything else shares a single VM boot, in the given order
+        # (kunit excepted: it runs during kernel boot, so always first)
+        kselftest_res, stress_ng_res, kunit_res, kvm_res = run_kselftest(
+            runner, kernel, config, filter_pattern=filter_pattern,
+            suites=shared)
+        by_name = {"kunit": kunit_res, "kselftest": kselftest_res,
+                   "stress-ng": stress_ng_res, "kvm-unit-tests": kvm_res}
+        for s in sorted(shared, key=lambda s: s != "kunit"):  # kunit first
+            if by_name[s]:
+                results.append(by_name[s])
+
+    if "ksmbd" in ordered and not ksmbd_first:
+        results.append(run_ksmbd(runner, kernel, config, tests=filter_pattern))
+
+    if default_run:
         upstream = fetch_upstream_failures(KCIDEV_PATH, kernel, arch=config.arch)
         regressions = detect_regressions(kernel, upstream)
         print_summary(results, regressions, len(upstream))
@@ -585,9 +598,14 @@ def main() -> None:
     p_run.add_argument("-f", "--filter", help="Filter kselftest (e.g. 'net:tls')")
     p_run.add_argument("--arch", default="x86_64", help="Architecture (default: x86_64)")
     p_run.add_argument("--retry", type=int, default=0, help="Retry failed tests N times")
-    p_run.add_argument("suite", nargs="?",
-                       choices=["kunit", "kselftest", "kvm-unit-tests", "stress", "ksmbd"],
-                       help="Run specific test suite")
+    p_run.add_argument("suite", nargs="*", metavar="suite",
+                       help=f"Test suites to run ({' '.join(KNOWN_SUITES)}). "
+                            "They share one VM boot and run in the order given. "
+                            "Exceptions: kunit executes during kernel boot, so "
+                            "it always runs first; ksmbd boots its own VM "
+                            "(before the others when listed first, otherwise "
+                            "after them). "
+                            f"Default: {' '.join(DEFAULT_SUITES)}")
 
     # report
     p_report = sub.add_parser("report", help="Compare results with KernelCI upstream")

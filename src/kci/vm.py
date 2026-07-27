@@ -36,6 +36,8 @@ class VirtmeRunner:
             f"--memory {config.memory} --cpus {config.cpus} "
             f"--append 'panic_on_warn=0' --network {network}"
         )
+        for param in config.append:
+            cmd += f" --append '{param}'"
         if user:
             cmd += f" --user {user}"
         # virtme passes --exec base64-encoded on the kernel command line;

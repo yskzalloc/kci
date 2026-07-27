@@ -42,6 +42,8 @@ class RunConfig:
     timeout_xfstests: int = 14400
     arch: str = "x86_64"
     retry: int = 0
+    # extra kernel command line parameters (vng --append)
+    append: list[str] = field(default_factory=list)
 
 
 @dataclass

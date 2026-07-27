@@ -10,7 +10,10 @@
 # CI:       DURATION=30/15/10/60/45
 # Removed: filesystem phase (4GB images), lcov/gcov
 #
-set -e
+# No "set -e": stressors regularly exit non-zero (--pathological,
+# --klog-check, unsupported syscalls); bugs are detected from dmesg
+# afterwards, and one failing stressor must not abort the rest of the
+# coverage run.
 export PATH=$PATH:/usr/bin:/usr/sbin
 
 PERF_PARANOID=/proc/sys/kernel/perf_event_paranoid
@@ -52,7 +55,15 @@ echo 0 | sudo tee /proc/sys/vm/oom_kill_allocating_task > /dev/null 2>&1
 # Prevent lockdep/warnings from causing kernel panic
 echo 0 | sudo tee /proc/sys/kernel/panic_on_warn > /dev/null 2>&1
 
-fallocate -l 512M $SWAP && chmod 0600 $SWAP && mkswap $SWAP && swapon $SWAP
+# Swap is best-effort: in a virtme-ng guest /tmp is tmpfs and the root
+# fs is virtiofs, and neither can host a swapfile (swapon: EINVAL).
+if fallocate -l 512M $SWAP && chmod 0600 $SWAP && mkswap $SWAP && swapon $SWAP; then
+    HAVE_SWAP=1
+else
+    echo "swap setup failed; continuing without swap"
+    HAVE_SWAP=0
+    rm -f $SWAP
+fi
 
 #
 # Phase 1: Read-only FS + device stressors
@@ -362,7 +373,7 @@ DURATION=30
 sudo $STRESS_NG --class io --seq -1 -v -t $DURATION 2>/dev/null
 
 # Cleanup
-swapoff $SWAP 2>/dev/null
+[ "$HAVE_SWAP" = "1" ] && swapoff $SWAP 2>/dev/null
 rm -f $SWAP
 
 echo ""

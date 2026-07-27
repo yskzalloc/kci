@@ -9,8 +9,17 @@ from pathlib import Path
 
 from ..models import KernelSource, RunConfig, TestResults
 from ..vm import VMRunner
-from . import kunit, stress
+from . import kunit, stress_ng
 from .common import KSELFTEST_SETUP, parse_bugs
+
+# kselftests that take down the VM itself rather than fail: the suspend
+# test puts the QEMU guest into deep suspend and nothing ever wakes it,
+# so the boot dies mid-run and every later suite's output is lost.
+SKIP_TESTS = ("breakpoints:step_after_suspend_test",)
+
+# In-guest wall-clock cap for the stress-ng coverage script; its phase
+# durations are scaled to ~2h total (see scripts/kernel-coverage.sh).
+STRESS_NG_TIMEOUT = 7200
 
 
 def validate_install(kernel: KernelSource) -> None:
@@ -57,68 +66,89 @@ def _retry_failed_tests(runner: VMRunner, kernel: KernelSource, config: RunConfi
 
 def run(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         filter_pattern: str | None = None,
-        include_stress: bool = False,
-        include_kunit: bool = False,
-        ) -> tuple[TestResults, TestResults | None, TestResults | None, TestResults | None]:
-    """Run kselftest (and optionally kunit + stress-ng) in a single VM boot."""
+        suites: tuple[str, ...] | list[str] = ("kselftest", "kvm-unit-tests", "stress-ng"),
+        ) -> tuple[TestResults | None, TestResults | None, TestResults | None, TestResults | None]:
+    """Run the given suites in a single VM boot, in the given order.
+
+    "kunit" is the exception: it executes during kernel boot itself, so its
+    part (which only captures the TAP output from dmesg) always goes first."""
     kernel.results_dir.mkdir(exist_ok=True)
     output = kernel.results_dir / "kselftest.txt"
     kunit_output = kernel.results_dir / "kunit.txt"
 
-    validate_install(kernel)
+    include_kunit = "kunit" in suites
+    include_kselftest = "kselftest" in suites
+    include_kvm = "kvm-unit-tests" in suites
+    include_stress_ng = "stress-ng" in suites
 
-    print(f"\n--- single boot: {'kunit + ' if include_kunit else ''}kselftest{' + stress' if include_stress else ''} ---")
+    if include_kselftest:
+        validate_install(kernel)
+
+    print(f"\n--- single boot: {' + '.join(suites)} ---")
     if filter_pattern:
         print(f"    filter: {filter_pattern}")
 
-    run_cmd = "./run_kselftest.sh"
-    if filter_pattern:
-        run_cmd = f"./run_kselftest.sh -t {filter_pattern}"
+    # Each part is self-contained (sets its own cwd) so they can be
+    # concatenated in any order.
+    parts: dict[str, str] = {}
 
-    # kunit part (kunit runs at boot via CONFIG_KUNIT, extract from dmesg)
-    kunit_part = ""
     if include_kunit:
-        kunit_part = (
+        parts["kunit"] = (
             "echo '=== KUNIT START ==='; "
             "dmesg | grep -E '(# Totals|not ok|ok [0-9])'; "
             "echo '=== KUNIT END ==='; "
         )
 
-    # Stress part
-    stress_part = ""
-    if include_stress:
-        stress_ng_bin = stress.prepare_script(kernel)
-        stress_part = (
-            "echo '=== STRESS START ==='; "
-            f"STRESS_NG={stress_ng_bin} bash .kci-stress.sh || true; "
-            "echo '=== STRESS END ==='; "
+    if include_kselftest:
+        skip_args = "".join(f" -S {t}" for t in SKIP_TESTS)
+        run_cmd = f"./run_kselftest.sh{skip_args}"
+        if filter_pattern:
+            run_cmd = f"./run_kselftest.sh -t {filter_pattern}"
+        parts["kselftest"] = (
+            f"cd {kernel.path}; "
+            "echo '=== KSELFTEST START ==='; "
+            f"cd kselftest_install && {run_cmd} 2>&1 || true; "
+            "echo '=== KSELFTEST END ==='; "
         )
 
     # kvm-unit-tests part (nested KVM inside vng)
     kvm_tests_dir = Path.home() / "kvm-unit-tests"
-    kvm_part = ""
-    if kvm_tests_dir.exists() and (kvm_tests_dir / "x86-run").exists():
-        kvm_part = (
+    if include_kvm and kvm_tests_dir.exists() and (kvm_tests_dir / "x86-run").exists():
+        parts["kvm-unit-tests"] = (
             "echo '=== KVM-UNIT-TESTS START ==='; "
             f"cd {kvm_tests_dir} && ACCEL=kvm ./run_tests.sh 2>&1 || true; "
             "echo '=== KVM-UNIT-TESTS END ==='; "
         )
 
+    if include_stress_ng:
+        stress_ng_bin = stress_ng.prepare_script(kernel)
+        # run from /root so stressor temp files stay off the kernel tree;
+        # the script path must be absolute for that to work.  The in-guest
+        # timeout confines an overrun to the stress section so the later
+        # suites and the END markers still execute.
+        parts["stress-ng"] = (
+            "cd /root; "
+            "echo '=== STRESS START ==='; "
+            f"STRESS_NG={stress_ng_bin} timeout -k 60 {STRESS_NG_TIMEOUT} "
+            f"bash {kernel.path}/.kci-stress.sh || true; "
+            "echo '=== STRESS END ==='; "
+        )
+
+    # kunit (boot-time) first, then the requested order
+    ordered = [s for s in suites if s == "kunit" and s in parts]
+    ordered += [s for s in suites if s != "kunit" and s in parts]
+
     exec_cmd = (
         f"{KSELFTEST_SETUP}; "
-        f"{kunit_part}"
-        "echo '=== KSELFTEST START ==='; "
-        f"cd kselftest_install && {run_cmd} 2>&1 || true; "
-        "echo '=== KSELFTEST END ==='; "
-        f"cd / && {kvm_part}"
-        f"cd /root && {stress_part}"
-        "echo '=== DMESG BUGS ==='; "
+        + "".join(parts[s] for s in ordered)
+        + "echo '=== DMESG BUGS ==='; "
         "dmesg | grep -E '(BUG:|WARNING:|UBSAN:|KASAN:|Oops:)'; "
         "echo '=== FULL DMESG ==='; "
         "dmesg"
     )
 
-    total_timeout = config.timeout_kselftest + (3900 if include_stress else 0)
+    total_timeout = config.timeout_kselftest + (
+        STRESS_NG_TIMEOUT + 300 if include_stress_ng else 0)
     result = runner.run(kernel, exec_cmd, config, user="root", network="user",
                         timeout=total_timeout)
 
@@ -144,23 +174,25 @@ def run(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         dmesg_content = stdout.split("=== FULL DMESG ===")[1]
         (kernel.results_dir / "dmesg.txt").write_text(dmesg_content)
 
-    if kselftest_text:
-        output.write_text(kselftest_text)
-        print(kselftest_text[-2000:] if len(kselftest_text) > 2000 else kselftest_text)
-    else:
-        print("Warning: no kselftest output captured")
+    results = None
+    if include_kselftest:
+        if kselftest_text:
+            output.write_text(kselftest_text)
+            print(kselftest_text[-2000:] if len(kselftest_text) > 2000 else kselftest_text)
+        else:
+            print("Warning: no kselftest output captured")
 
-    results = parse_results(output)
-    results.bugs = parse_bugs(stdout)
-    if results.bugs:
-        print(f"  ⚠️  {len(results.bugs)} kernel bugs detected")
+        results = parse_results(output)
+        results.bugs = parse_bugs(stdout)
+        if results.bugs:
+            print(f"  ⚠️  {len(results.bugs)} kernel bugs detected")
 
-    # Parse stress results
-    stress_results = None
-    if include_stress and "=== STRESS START ===" in stdout and "=== STRESS END ===" in stdout:
-        stress_text = stdout.split("=== STRESS START ===")[1].split("=== STRESS END ===")[0]
-        stress_results = stress.parse_results(kernel, stress_text)
-        print(f"\n--- stress-ng: {stress_results.failed} bugs detected ---")
+    # Parse stress-ng results
+    stress_ng_results = None
+    if include_stress_ng and "=== STRESS START ===" in stdout and "=== STRESS END ===" in stdout:
+        stress_ng_text = stdout.split("=== STRESS START ===")[1].split("=== STRESS END ===")[0]
+        stress_ng_results = stress_ng.parse_results(kernel, stress_ng_text)
+        print(f"\n--- stress-ng: {stress_ng_results.failed} bugs detected ---")
 
     # Parse kvm-unit-tests results
     kvm_results = None
@@ -181,7 +213,7 @@ def run(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         )
 
     # Per-test retry
-    if config.retry > 0 and results.failed_tests:
+    if config.retry > 0 and results and results.failed_tests:
         print(f"  Retrying {len(results.failed_tests)} failed tests (up to {config.retry}x)...")
         still_failed, flaky = _retry_failed_tests(
             runner, kernel, config, results.failed_tests, config.retry)
@@ -192,7 +224,7 @@ def run(runner: VMRunner, kernel: KernelSource, config: RunConfig,
         if flaky:
             print(f"  {len(flaky)} tests marked flaky (passed on retry)")
 
-    return results, stress_results, (kunit.parse_results(kunit_output) if include_kunit else None), kvm_results
+    return results, stress_ng_results, (kunit.parse_results(kunit_output) if include_kunit else None), kvm_results
 
 
 def parse_results(output: Path) -> TestResults:

@@ -231,7 +231,7 @@ def _kvm_tests(results_dir: Path, add) -> None:
             m.group(3).strip() or None)
 
 
-def _stress_test(results_dir: Path, add) -> None:
+def _stress_ng_test(results_dir: Path, add) -> None:
     f = results_dir / "stress-ng.txt"
     if not f.exists():
         return
@@ -270,7 +270,7 @@ def generate_submission(kernel: KernelSource, origin: str = "kci",
     _kunit_tests(results_dir, add)
     _kselftest_tests(results_dir, add)
     _kvm_tests(results_dir, add)
-    _stress_test(results_dir, add)
+    _stress_ng_test(results_dir, add)
 
     return {
         "version": SCHEMA_VERSION,
