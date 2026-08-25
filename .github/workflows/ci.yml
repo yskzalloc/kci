@@ -85,7 +85,7 @@ jobs:
         run: kci init
 
       - name: Clone DEPT kernel
-        run: git clone -b dept19_v7.0 --depth 1 https://github.com/maxbyungchulpark/linux-dept.git ~/linux
+        run: git clone -b dept19.1_v7.2 --depth 1 https://github.com/yskzalloc/linux-dept.git ~/linux
 
       # CONFIG_DEPT (lib/Kconfig.debug) selects everything else it needs
       # (PROVE_LOCKING, DEBUG_SPINLOCK/MUTEXES/RWSEMS, TRACE_IRQFLAGS, ...);
